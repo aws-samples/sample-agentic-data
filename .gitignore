@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+node_modules/
+.env
+*.db
+*.sqlite3
+.DS_Store
+*.log
+*.bak
+*.bak.*
+cdk.context.json

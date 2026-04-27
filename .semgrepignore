@@ -1,0 +1,11 @@
+# Vue.js template files use unquoted attribute bindings (v-bind, :attr, v-if, etc.)
+web/index.html
+
+# Third-party vendored libraries
+web/vendor/
+
+# SQL construction uses _safe_identifier() validated identifiers, not user input.
+# semgrep formatted-sql-query / psycopg-sqli are false positives on these files.
+agentic_core/db_engine.py
+agentic_core/agents.py
+agentic_core/tools.py

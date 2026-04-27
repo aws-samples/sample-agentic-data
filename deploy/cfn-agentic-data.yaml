@@ -1,0 +1,1078 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Agentic ChatBI — One-Click Deployment
+  Multi-Agent Data Analysis (Strands SDK + Bedrock)
+  Supports EC2 or ECS Fargate, Global and China regions.
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  DeploymentMode:
+    Type: String
+    Default: EC2
+    AllowedValues: [EC2, ECS]
+    Description: "Compute: EC2 (simpler) or ECS Fargate (scalable)"
+
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues: [t4g.small, t4g.medium, t4g.large, t4g.xlarge, m7g.medium, m7g.large]
+    Description: "EC2 instance type (Graviton ARM)"
+
+  SupervisorModel:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6-20250514
+    Description: "Bedrock model ID for Supervisor agent"
+
+  SubAgentModel:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20250515
+    Description: "Bedrock model ID for Sub-agents"
+
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+
+  ContainerImageUri:
+    Type: String
+    Description: "ECR image URI (account.dkr.ecr.region.amazonaws.com/repo:tag)"
+
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: "EC2 Key Pair (optional, for SSH access)"
+
+  EnableAuth:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  ExtraModels:
+    Type: String
+    Default: ""
+    Description: "Additional models JSON, e.g. {\"My Model\":\"model-id\"}"
+
+  EcsTaskCpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048"]
+    Description: "ECS task CPU units"
+
+  EcsTaskMemory:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["1024", "2048", "4096"]
+    Description: "ECS task memory (MB)"
+
+# ============================================================
+# Conditions
+# ============================================================
+Conditions:
+  IsEC2: !Equals [!Ref DeploymentMode, EC2]
+  IsECS: !Equals [!Ref DeploymentMode, ECS]
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
+# ============================================================
+# Mappings
+# ============================================================
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ── Networking ──────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Flow logs require logs:* on Resource * per AWS documentation"
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "Flow logs IAM policy requires wildcard resource for CloudWatch Logs"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: flow-log-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch default encryption sufficient for VPC flow logs"
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch default encryption sufficient for VPC flow logs"
+    Properties:
+      LogGroupName: !Sub "/vpc-flow-logs/${AWS::StackName}"
+      RetentionInDays: 14
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: REJECT
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W33
+            reason: "Public subnet requires MapPublicIpOnLaunch for ALB and NAT Gateway"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-pub-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W33
+            reason: "Public subnet requires MapPublicIpOnLaunch for ALB and NAT Gateway"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-pub-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-priv-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-priv-2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-pub-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PubSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PubSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway for private subnets
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-priv-rt"
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+
+  PrivSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # VPC Endpoints (save NAT costs)
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+      VpcEndpointType: Gateway
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+      VpcEndpointType: Gateway
+
+  # ── Security Groups ────────────────────────────────────
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: "Egress to 0.0.0.0/0 required for ALB health checks and backend connectivity"
+          - id: W40
+            reason: "All-protocol egress intentional for ALB"
+    Properties:
+      GroupDescription: ALB - HTTPS from allowed sources only (NO 0.0.0.0/0)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCIDR
+          Description: "HTTPS from allowed CIDRs"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Note
+          Value: "Add additional CIDRs via console or CLI if needed. Never use 0.0.0.0/0"
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: "Egress required for Bedrock API, ECR pull, package installs"
+          - id: W40
+            reason: "All-protocol egress intentional for app connectivity"
+    Properties:
+      GroupDescription: App - only from ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: "App port from ALB only"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound (internet access for package installs, API calls)"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app-sg"
+
+  # ── ALB ─────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+          - id: W52
+            reason: "Access logging requires dedicated S3 bucket with ELB service principal policy"
+      checkov:
+        skip:
+          - id: CKV_AWS_91
+            comment: "Access logging requires dedicated S3 bucket with ELB service principal; DataBucket is application data"
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      Port: 8501
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: !If [IsECS, ip, instance]
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: "86400"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: "HTTP listener for initial deploy; HTTPS requires ACM certificate post-deploy"
+      checkov:
+        skip:
+          - id: CKV_AWS_2
+            comment: "HTTPS requires ACM certificate configured post-deploy"
+          - id: CKV_AWS_103
+            comment: "TLS configured post-deploy with ACM"
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ── S3 ──────────────────────────────────────────────────
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+          - id: W35
+            reason: "This bucket serves as the log destination; self-logging creates infinite loop"
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "This bucket is the log destination itself"
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: agentic-data
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ── DynamoDB Tables ─────────────────────────────────────
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "AWS managed SSE encryption is sufficient for this workload"
+    Properties:
+      TableName: !Sub "${AWS::StackName}-events"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: vin
+          AttributeType: S
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: vin
+          KeyType: HASH
+        - AttributeName: event_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: agentic-data
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "AWS managed SSE encryption is sufficient for this workload"
+    Properties:
+      TableName: !Sub "${AWS::StackName}-chat-history"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: agentic-data
+
+  CostTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "AWS managed SSE encryption is sufficient for this workload"
+    Properties:
+      TableName: !Sub "${AWS::StackName}-cost"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: date
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: date
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: agentic-data
+
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "AWS managed SSE encryption is sufficient for this workload"
+    Properties:
+      TableName: !Sub "${AWS::StackName}-config"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: config_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: agentic-data
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "AWS managed SSE encryption is sufficient for this workload"
+    Properties:
+      TableName: !Sub "${AWS::StackName}-feedback"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: agentic-data
+
+  # ── IAM — Customer Managed (NO AWS Managed Policies) ───
+  AppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+          - id: W13
+            reason: "ecr:GetAuthorizationToken requires Resource: * per AWS documentation"
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-app-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Bedrock InvokeModel
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - "arn:aws:bedrock:*:*:inference-profile/us.*"
+              - "arn:aws:bedrock:*:*:inference-profile/global.*"
+          # Bedrock Guardrails
+          - Sid: BedrockGuardrails
+            Effect: Allow
+            Action:
+              - bedrock:ApplyGuardrail
+            Resource:
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+          # S3
+          - Sid: S3DataAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+          # DynamoDB
+          - Sid: DynamoDBAccess
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+            Resource:
+              - !GetAtt EventsTable.Arn
+              - !GetAtt ChatHistoryTable.Arn
+              - !GetAtt CostTable.Arn
+              - !GetAtt ConfigTable.Arn
+              - !GetAtt FeedbackTable.Arn
+          # Athena
+          - Sid: AthenaAccess
+            Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+              - athena:GetQueryResults
+              - athena:StopQueryExecution
+            Resource:
+              - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary"
+          # Glue (required by Athena)
+          - Sid: GlueReadOnly
+            Effect: Allow
+            Action:
+              - glue:GetTable
+              - glue:GetTables
+              - glue:GetDatabase
+              - glue:GetDatabases
+              - glue:GetPartitions
+            Resource:
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/agentic_auto"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/agentic_auto/*"
+          # CloudWatch Logs
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/agentic-data/*"
+          # ECR (pull images)
+          - Sid: ECRAuth
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: ECRPull
+            Effect: Allow
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchCheckLayerAvailability
+            Resource:
+              - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*"
+
+  # -- EC2 Role --
+  EC2Role:
+    Type: AWS::IAM::Role
+    Condition: IsEC2
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref AppPolicy
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: IsEC2
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-ec2-profile"
+      Roles:
+        - !Ref EC2Role
+
+  # -- ECS Roles --
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Condition: IsECS
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref AppPolicy
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsECS
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name for operational clarity"
+          - id: W11
+            reason: "ecr:GetAuthorizationToken requires Resource: * per AWS documentation"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ecs-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/agentic-data/*"
+
+  # ── EC2 Instance ────────────────────────────────────────
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: IsEC2
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-lt"
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${AWS::StackName}-app"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            # Install Docker
+            yum update -y
+            yum install -y docker aws-cli
+            systemctl enable docker && systemctl start docker
+
+            # Login to ECR
+            REGION=${AWS::Region}
+            ACCOUNT=${AWS::AccountId}
+            ECR_DOMAIN="${!ACCOUNT}.dkr.ecr.${!REGION}.amazonaws.com"
+            if [[ "$REGION" == cn-* ]]; then
+            ECR_DOMAIN="${!ACCOUNT}.dkr.ecr.${!REGION}.amazonaws.com.cn"
+            fi
+            aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_DOMAIN
+
+            # Pull and run
+            IMAGE_URI="${ContainerImageUri}"
+            docker pull $IMAGE_URI
+
+            docker run -d --name agentic-data \
+            --restart always \
+            -p 8501:8501 \
+            -e AGENTIC_AUTO_REGION=${AWS::Region} \
+            -e AGENTIC_AUTO_DATA_BUCKET=${DataBucket} \
+            -e AGENTIC_AUTO_REPORTS_BUCKET=${DataBucket} \
+            -e AGENTIC_AUTO_EVENTS_TABLE=${EventsTable} \
+            -e AGENTIC_AUTO_CHAT_TABLE=${ChatHistoryTable} \
+            -e AGENTIC_AUTO_COST_TABLE=${CostTable} \
+            -e AGENTIC_AUTO_CONFIG_TABLE=${ConfigTable} \
+            -e AGENTIC_AUTO_FEEDBACK_TABLE=${FeedbackTable} \
+            -e AGENTIC_AUTO_SUP_MODEL=${SupervisorModel} \
+            -e AGENTIC_AUTO_SUB_MODEL=${SubAgentModel} \
+            -e AGENTIC_AUTO_AUTH_ENABLED=${EnableAuth} \
+            -e AGENTIC_AUTO_EXTRA_MODELS=${ExtraModels} \
+            $IMAGE_URI
+
+            # Signal success
+            echo "✅ Agentic Data container started"
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: IsEC2
+    DependsOn: GatewayAttachment
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app"
+          PropagateAtLaunch: true
+
+  # ── ECS Cluster + Service ───────────────────────────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Condition: IsECS
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsECS
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch default encryption is sufficient for application logs"
+    Properties:
+      LogGroupName: !Sub "/agentic-data/${AWS::StackName}"
+      RetentionInDays: 14
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: IsECS
+    Properties:
+      Family: !Sub "${AWS::StackName}-task"
+      Cpu: !Ref EcsTaskCpu
+      Memory: !Ref EcsTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: agentic-data
+          Image: !Ref ContainerImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+          Environment:
+            - Name: AGENTIC_AUTO_REGION
+              Value: !Ref "AWS::Region"
+            - Name: AGENTIC_AUTO_DATA_BUCKET
+              Value: !Ref DataBucket
+            - Name: AGENTIC_AUTO_REPORTS_BUCKET
+              Value: !Ref DataBucket
+            - Name: AGENTIC_AUTO_EVENTS_TABLE
+              Value: !Ref EventsTable
+            - Name: AGENTIC_AUTO_CHAT_TABLE
+              Value: !Ref ChatHistoryTable
+            - Name: AGENTIC_AUTO_COST_TABLE
+              Value: !Ref CostTable
+            - Name: AGENTIC_AUTO_CONFIG_TABLE
+              Value: !Ref ConfigTable
+            - Name: AGENTIC_AUTO_FEEDBACK_TABLE
+              Value: !Ref FeedbackTable
+            - Name: AGENTIC_AUTO_SUP_MODEL
+              Value: !Ref SupervisorModel
+            - Name: AGENTIC_AUTO_SUB_MODEL
+              Value: !Ref SubAgentModel
+            - Name: AGENTIC_AUTO_AUTH_ENABLED
+              Value: !Ref EnableAuth
+            - Name: AGENTIC_AUTO_EXTRA_MODELS
+              Value: !Ref ExtraModels
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:8501/ || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Condition: IsECS
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-svc"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroup
+      LoadBalancers:
+        - TargetGroupArn: !Ref ALBTargetGroup
+          ContainerName: agentic-data
+          ContainerPort: 8501
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  ALBURL:
+    Description: Application URL
+    Value: !Sub "http://${ALB.DNSName}"
+
+  ALBDNSName:
+    Description: ALB DNS Name
+    Value: !GetAtt ALB.DNSName
+
+  DataBucketName:
+    Description: S3 Data Bucket
+    Value: !Ref DataBucket
+
+  DeploymentMode:
+    Description: Compute mode used
+    Value: !Ref DeploymentMode
+
+  Region:
+    Description: Deployment region
+    Value: !Ref "AWS::Region"
+
+  NextStep:
+    Description: Post-deployment steps
+    Value: "Run: ./deploy.sh --init-data to upload sample data to S3 and DynamoDB"

@@ -1,0 +1,25 @@
+version: "3.8"
+services:
+  agentic-data:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - AGENTIC_AUTO_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - AGENTIC_AUTO_DATA_BUCKET=${DATA_BUCKET:-}
+      - AGENTIC_AUTO_EVENTS_TABLE=agentic-auto-events
+      - AGENTIC_AUTO_CHAT_TABLE=agentic-auto-chat-history
+      - AGENTIC_AUTO_COST_TABLE=agentic-auto-cost
+      - AGENTIC_AUTO_CONFIG_TABLE=agentic-auto-config
+      - AGENTIC_AUTO_FEEDBACK_TABLE=agentic-auto-feedback
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
