@@ -3,6 +3,7 @@ Local JWT Authentication — Cognito-free auth for China region.
 Users stored in DynamoDB config table. Passwords hashed with bcrypt.
 """
 import json
+import logging
 import time
 import hashlib
 import hmac
@@ -11,6 +12,8 @@ import os
 import boto3
 
 from config import CONFIG_TABLE, REGION
+
+logger = logging.getLogger(__name__)
 
 _JWT_SECRET = os.environ.get("AGENTIC_AUTO_JWT_SECRET", "agentic-data-default-secret-change-me")
 _ADMIN_PASSWORD = os.environ.get("AGENTIC_AUTO_ADMIN_PASSWORD", "")  # Must be set via env var at deploy time
