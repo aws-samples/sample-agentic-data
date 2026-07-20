@@ -92,8 +92,12 @@ def _detect_metric_field(field_name, field_type, values):
     if field_type not in ("integer", "float"):
         return False
     name_lower = field_name.lower()
-    # Skip ID-like numeric fields
-    if any(p in name_lower for p in ["_id", "id", "code", "编号", "year", "月", "日"]):
+    # Skip ID-like numeric fields. Match "id"/"_id" precisely (standalone name
+    # or "_id" suffix) instead of as a substring, otherwise measurement fields
+    # such as "width", "humidity" or "grid_load" are wrongly excluded.
+    if name_lower == "id" or name_lower.endswith("_id"):
+        return False
+    if any(p in name_lower for p in ["code", "编号", "year", "月", "日"]):
         return False
     return True
 
