@@ -11,6 +11,7 @@ set -euo pipefail
 #   --china              Deploy to China region (cn-north-1)
 #   --stack NAME         Stack name (default: agentic-data)
 #   --instance TYPE      EC2 instance type (default: t4g.medium)
+#   --key NAME           EC2 key pair name (optional, enables SSH)
 #   --init-data          Upload sample data after deploy
 #   --destroy            Delete the stack
 #   --help               Show this help
@@ -19,6 +20,7 @@ set -euo pipefail
 # Defaults
 MODE="EC2"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+REGION_EXPLICIT=""
 STACK_NAME="agentic-data"
 INSTANCE_TYPE="t4g.medium"
 CHINA=""
@@ -32,19 +34,25 @@ KEY_PAIR=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode)     MODE="${2^^}"; shift 2 ;;
-    --region)   REGION="$2"; shift 2 ;;
-    --china)    CHINA="true"; REGION="${REGION:-cn-north-1}"; shift ;;
+    --region)   REGION="$2"; REGION_EXPLICIT="true"; shift 2 ;;
+    --china)    CHINA="true"; shift ;;
     --stack)    STACK_NAME="$2"; shift 2 ;;
     --instance) INSTANCE_TYPE="$2"; shift 2 ;;
     --key)      KEY_PAIR="$2"; shift 2 ;;
     --init-data) INIT_DATA="true"; shift ;;
     --destroy)  DESTROY="true"; shift ;;
     --help)
-      head -14 "$0" | tail -12
+      # Print the usage block delimited by the two "# ===" banner rules
+      sed -n '/^# ===/,/^# ===/p' "$0" | sed '1d;$d'
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+# --china selects the default China region, unless --region was given explicitly
+if [[ "$CHINA" == "true" ]] && [[ -z "$REGION_EXPLICIT" ]]; then
+  REGION="cn-north-1"
+fi
 
 # China region adjustments
 if [[ "$CHINA" == "true" ]] || [[ "$REGION" == cn-* ]]; then
