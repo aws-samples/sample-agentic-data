@@ -35,6 +35,12 @@ Parameters:
     Default: "10.0.0.0/16"
     AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
 
+  AllowedCIDR:
+    Type: String
+    Default: "10.0.0.0/8"
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: "CIDR allowed to reach the ALB. Override with your public IP/range; never use 0.0.0.0/0."
+
   ContainerImageUri:
     Type: String
     Description: "ECR image URI (account.dkr.ecr.region.amazonaws.com/repo:tag)"
@@ -322,10 +328,15 @@ Resources:
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCIDR
+          Description: "HTTP from allowed CIDRs"
+        - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: !Ref AllowedCIDR
-          Description: "HTTPS from allowed CIDRs"
+          Description: "HTTPS from allowed CIDRs (post-deploy ACM listener)"
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: "0.0.0.0/0"
