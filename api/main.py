@@ -1504,8 +1504,8 @@ def delete_session(session_id: str):
 def get_scenarios(request: Request):
     """Get all scenarios for the current user, with V2 RBAC filtering."""
     try:
-        # Get user role from auth
-        user_role = getattr(request.state, "role", "admin") if hasattr(request, "state") else "admin"
+        # Get user role from auth (middleware stores the user dict on request.state.user)
+        user_role = get_current_user(request).get("role", "viewer")
         
         r = _ddb.Table(CONFIG_TABLE).get_item(Key={"config_key": "scenarios"})
         data = r.get("Item", {}).get("data", "{}")
