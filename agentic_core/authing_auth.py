@@ -5,11 +5,11 @@ Uses standard OIDC Authorization Code Flow.
 """
 import json
 import time
-import base64
 import urllib.request
 import urllib.parse
 import logging
 import os
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,58 @@ AUTHING_REDIRECT_URI = os.environ.get("AGENTIC_AUTO_AUTHING_REDIRECT_URI", "")
 AUTHING_POOL_ID = os.environ.get("AGENTIC_AUTO_AUTHING_POOL_ID", "")
 
 
-def _decode_jwt_payload(token: str) -> dict:
+@lru_cache(maxsize=1)
+def _oidc_metadata() -> dict:
+    """Authing's OIDC discovery document. Gives the issuer and JWKS URI authoritatively."""
+    if not AUTHING_DOMAIN:
+        raise ValueError("AGENTIC_AUTO_AUTHING_DOMAIN is not configured")
+    url = f"https://{AUTHING_DOMAIN}/.well-known/openid-configuration"
+    with urllib.request.urlopen(url, timeout=10) as resp:  # nosec B310 - fixed, configured host
+        return json.loads(resp.read(1024 * 1024))
+
+
+@lru_cache(maxsize=1)
+def _jwks_client():
+    import jwt  # PyJWT
+    return jwt.PyJWKClient(_oidc_metadata()["jwks_uri"])
+
+
+def _verify_jwt(token: str) -> dict:
+    """Verify an Authing JWT and return its claims.
+
+    This replaces a function that base64-decoded the payload and returned it
+    without touching the signature. Any caller could mint
+    {"email": "<an admin>", "exp": <future>}, append arbitrary bytes as a
+    signature, and be authenticated as that user -- the same missing-verification
+    class as the reported finding, on the Authing provider path.
+
+    Raises ValueError on any failure so the caller fails closed.
+    """
+    import jwt
+    from jwt import InvalidTokenError
+    if not token:
+        raise ValueError("No token supplied")
     try:
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return {}
+        meta = _oidc_metadata()
+        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=meta["issuer"],
+            audience=AUTHING_APP_ID or None,
+            options={
+                "verify_aud": bool(AUTHING_APP_ID),
+                "require": ["exp", "iss", "sub"],
+            },
+        )
+    except InvalidTokenError as exc:
+        raise ValueError(f"Invalid token: {exc}") from exc
+    except Exception as exc:
+        # JWKS or discovery failure. Refuse the token rather than fall back to
+        # reading it unverified.
+        logger.warning("Authing token verification failed: %s", exc)
+        raise ValueError("Token could not be verified") from exc
 
 
 def get_auth_config() -> dict:
@@ -64,7 +109,7 @@ def _get_or_create_user_role(email: str, default_role: str = "viewer") -> str:
             "created_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
         }
         _save_users(users)
-        logger.info(f"Auto-created Authing user: {email} with role={default_role}")
+        logger.info("Auto-created Authing user on first SSO login with role=%s", default_role)
         return default_role
     except Exception as e:
         logger.error(f"Failed to get/create user role: {e}")
@@ -96,7 +141,7 @@ def exchange_code(code: str) -> dict:
         access_token = result.get("access_token", "")
         refresh_token = result.get("refresh_token", "")
 
-        payload = _decode_jwt_payload(id_token)
+        payload = _verify_jwt(id_token)
         email = payload.get("email", payload.get("phone_number", ""))
         role = payload.get("custom:role", payload.get("role", "viewer"))
 
@@ -124,12 +169,16 @@ def exchange_code(code: str) -> dict:
 
 
 def verify_token(token: str) -> dict:
-    """Verify token by decoding JWT payload. Role always from DynamoDB (not JWT)."""
-    payload = _decode_jwt_payload(token)
-    if not payload:
-        return {"error": "Invalid token"}
-    if payload.get("exp", 0) < time.time():
-        return {"error": "Token expired"}
+    """Verify an Authing token's signature and claims. Role always from DynamoDB.
+
+    Expiry is enforced by the decoder, which also checks the signature, issuer
+    and audience. The previous implementation checked only `exp`, on a payload it
+    had not verified -- so `exp` was whatever the caller chose to put there.
+    """
+    try:
+        payload = _verify_jwt(token)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     email = payload.get("email", payload.get("phone_number", ""))
     # Always get role from DynamoDB — Authing JWT doesn't carry role

@@ -1,0 +1,443 @@
+"""Regression checks for the second remediation pass.
+
+Covers the six CodeQL critical findings (one command execution, five
+server-side request forgery), the unverified-signature path on the Authing
+provider, password storage, the read-only SQL guard, and the import break that
+the first pass left behind.
+
+Runs as a script so it needs no pytest:
+
+    python3 tests/test_hardening_regression.py
+
+Checks that read source rather than calling the function say so in their name.
+Importing api/main.py needs the full runtime (strands, boto3, a live config), so
+the endpoint-level facts are asserted against the source text; the guards
+themselves are imported and called for real.
+"""
+import ast
+import hashlib
+import importlib.util
+import os
+import sys
+import types
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+PASSED, FAILED = [], []
+
+
+def check(name):
+    def deco(fn):
+        try:
+            fn()
+            PASSED.append(name)
+            print(f"  PASS  {name}")
+        except AssertionError as exc:
+            FAILED.append(name)
+            print(f"  FAIL  {name}\n          {exc}")
+        except Exception as exc:
+            FAILED.append(name)
+            print(f"  ERROR {name}\n          {type(exc).__name__}: {exc}")
+        return fn
+    return deco
+
+
+def _load(path, name):
+    """Load one module by path, bypassing the package __init__ and its heavy imports."""
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _source(path):
+    with open(os.path.join(ROOT, path), encoding="utf-8") as fh:
+        return fh.read()
+
+
+# ───────────────────────── the import break ─────────────────────────
+
+@check("every name api/main.py imports from auth exists in auth.py")
+def _():
+    main_tree = ast.parse(_source("api/main.py"))
+    wanted = set()
+    for node in ast.walk(main_tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "auth":
+            wanted.update(alias.name for alias in node.names)
+    assert wanted, "no `from auth import ...` found -- check moved?"
+
+    auth_tree = ast.parse(_source("auth.py"))
+    defined = set()
+    for node in auth_tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            defined.update((a.asname or a.name).split(".")[0] for a in node.names)
+
+    missing = sorted(wanted - defined)
+    # The first pass deleted _decode_jwt_payload from auth.py and left the import
+    # in main.py, so the application raised ImportError before serving anything.
+    assert not missing, f"api/main.py imports names auth.py does not define: {missing}"
+
+
+@check("no unverified JWT decoder remains in either module")
+def _():
+    for path in ("api/main.py", "agentic_core/authing_auth.py"):
+        src = _source(path)
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                assert node.func.id != "_decode_jwt_payload", \
+                    f"{path} still calls _decode_jwt_payload"
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                assert node.name != "_decode_jwt_payload", \
+                    f"{path} still defines _decode_jwt_payload"
+
+
+# ───────────────────── CWE-918: request forgery ─────────────────────
+
+NG = _load("agentic_core/net_guard.py", "net_guard")
+
+
+def _blocked(url):
+    try:
+        NG.validate_outbound_url(url)
+    except NG.BlockedRequestError:
+        return True
+    return False
+
+
+@check("instance metadata service is unreachable from a caller-supplied URL")
+def _():
+    assert _blocked("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+
+
+@check("ECS task-role credential endpoint is unreachable")
+def _():
+    # The one that matters on Fargate: this returns usable AWS credentials over
+    # plain HTTP, and the handlers echoed response bodies back to the caller.
+    assert _blocked("http://169.254.170.2/v2/credentials/")
+
+
+@check("IPv6-mapped form of the metadata address is blocked too")
+def _():
+    assert _blocked("http://[::ffff:169.254.169.254]/latest/meta-data/")
+
+
+@check("loopback is blocked by address and by name")
+def _():
+    assert _blocked("http://127.0.0.1:8000/api/")
+    assert _blocked("http://localhost/")
+
+
+@check("only http and https are accepted")
+def _():
+    for url in ("file:///etc/passwd", "gopher://example.com/", "ftp://example.com/"):
+        assert _blocked(url), url
+
+
+@check("credentials embedded in the URL are refused")
+def _():
+    assert _blocked("http://user:password@example.com/")
+
+
+@check("private addresses need an explicit opt-in, link-local never gets one")
+def _():
+    os.environ.pop("AGENTIC_AUTO_ALLOW_PRIVATE_EGRESS", None)
+    assert _blocked("http://10.0.0.5:11434/api/generate"), "private allowed by default"
+    os.environ["AGENTIC_AUTO_ALLOW_PRIVATE_EGRESS"] = "true"
+    try:
+        NG.validate_outbound_url("http://10.0.0.5:11434/api/generate")
+    except NG.BlockedRequestError as exc:
+        raise AssertionError(f"opt-in did not permit a VPC endpoint: {exc}")
+    assert _blocked("http://169.254.170.2/"), \
+        "the opt-in must not reach the credential endpoint"
+    os.environ.pop("AGENTIC_AUTO_ALLOW_PRIVATE_EGRESS", None)
+
+
+@check("redirects are refused rather than followed")
+def _():
+    # A validated public URL answering 302 with a metadata address in Location
+    # would otherwise defeat the address check entirely.
+    handler = NG._NoRedirects()
+    try:
+        handler.redirect_request(None, None, 302, "Found", {},
+                                 "http://169.254.169.254/latest/meta-data/")
+    except NG.BlockedRequestError:
+        return
+    raise AssertionError("redirect was not refused")
+
+
+@check("a legitimate public endpoint still passes")
+def _():
+    NG.validate_outbound_url("https://api.openai.com/v1/chat/completions")
+
+
+@check("every caller-supplied fetch in api/main.py goes through the guard")
+def _():
+    src = _source("api/main.py")
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    unguarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = ""
+        if isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        elif isinstance(node.func, ast.Name):
+            name = node.func.id
+        if name != "urlopen":
+            continue
+        # A literal URL is not caller-supplied; those are the localhost probe and
+        # the Cognito token endpoint.
+        arg = node.args[0] if node.args else None
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            continue
+        if isinstance(arg, ast.Name) and arg.id == "req":
+            unguarded.append((node.lineno, lines[node.lineno - 1].strip()[:90]))
+            continue
+        unguarded.append((node.lineno, lines[node.lineno - 1].strip()[:90]))
+    assert not unguarded, f"raw urlopen on a non-literal URL: {unguarded}"
+
+
+# ──────────────── CWE-78: command execution removed ────────────────
+
+@check("api/main.py no longer spawns a process anywhere")
+def _():
+    src = _source("api/main.py")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [(a.name or "") for a in node.names]
+            mod = getattr(node, "module", "") or ""
+            assert "subprocess" not in names and mod != "subprocess", \
+                f"subprocess imported at line {node.lineno}"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            assert node.func.attr not in ("Popen", "system", "popen", "run", "call"), \
+                f"process spawn at line {node.lineno}"
+
+
+@check("the stdio MCP test refuses instead of executing the request's command")
+def _():
+    src = _source("api/main.py")
+    i = src.index('if transport == "stdio":')
+    branch = src[i:src.index('elif transport == "sse":', i)]
+    # Strip comments first: the replacement explains what it removed, so the
+    # word Popen legitimately appears in prose right there.
+    code_only = "\n".join(
+        line.split("#", 1)[0] for line in branch.splitlines()
+    )
+    assert "Popen" not in code_only, "the spawn is still there"
+    assert "400" in branch, "the branch should answer 400"
+
+
+# ──────────────────── authorization on the admin plane ────────────────────
+
+ADMIN_HANDLERS = [
+    "api_add_custom_model", "api_del_custom_model", "api_test_model",
+    "api_datasource_test", "api_update_datasource", "api_add_datasource",
+    "api_delete_datasource", "api_add_mcp", "api_del_mcp", "api_test_mcp",
+    "api_list_mcp_tools", "api_connect_datasource", "api_apply_introspection",
+]
+
+
+@check("configuration endpoints require an administrator, not just a session")
+def _():
+    tree = ast.parse(_source("api/main.py"))
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in ADMIN_HANDLERS:
+            defaults = node.args.defaults + [d for d in node.args.kw_defaults if d]
+            found[node.name] = any(
+                isinstance(d, ast.Call)
+                and isinstance(d.func, ast.Name) and d.func.id == "Depends"
+                and d.args and isinstance(d.args[0], ast.Name)
+                and d.args[0].id == "require_admin"
+                for d in defaults
+            )
+    missing = sorted(n for n in ADMIN_HANDLERS if not found.get(n))
+    assert not missing, f"no require_admin dependency on: {missing}"
+
+
+@check("require_admin rejects an unauthenticated caller and a non-admin role")
+def _():
+    os.environ["AGENTIC_AUTO_AUTH_ENABLED"] = "true"
+    os.environ.setdefault("AGENTIC_DATA_ENV", "dev")
+    sys.path.insert(0, ROOT)
+    import importlib
+    import auth as auth_mod
+    importlib.reload(auth_mod)
+    from fastapi import HTTPException
+
+    class Req:
+        def __init__(self, user):
+            self.state = types.SimpleNamespace()
+            if user is not None:
+                self.state.user = user
+
+    for user, label in [
+        (None, "no user on request state"),
+        ({"user_id": "a", "role": "viewer", "unauthenticated": True}, "unauthenticated"),
+        ({"user_id": "a", "role": "viewer"}, "viewer"),
+        ({"user_id": "a", "role": "analyst"}, "analyst"),
+    ]:
+        try:
+            auth_mod.require_admin(Req(user))
+        except HTTPException as exc:
+            assert exc.status_code == 403, f"{label}: expected 403, got {exc.status_code}"
+            continue
+        raise AssertionError(f"{label} was accepted as an administrator")
+
+    assert auth_mod.require_admin(Req({"user_id": "a", "role": "admin"}))["role"] == "admin"
+
+
+# ─────────────── CWE-347 on the Authing provider path ───────────────
+
+@check("Authing no longer accepts a token it has not verified")
+def _():
+    import base64
+    import json
+    sys.modules.setdefault("boto3", types.ModuleType("boto3"))
+    aa = _load("agentic_core/authing_auth.py", "authing_auth_t")
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    import time
+    forged = ".".join([
+        seg({"alg": "RS256", "typ": "JWT"}),
+        seg({"sub": "attacker", "email": "admin@agentic-data.com",
+             "exp": int(time.time()) + 86400}),
+        "not-a-signature",
+    ])
+    # Previously: base64-decode the payload, compare exp, return the claims.
+    result = aa.verify_token(forged)
+    assert isinstance(result, dict) and "error" in result, \
+        f"forged Authing token accepted: {result}"
+
+
+# ───────────────────────── password storage ─────────────────────────
+
+@check("passwords are stored with PBKDF2, and legacy hashes still log in")
+def _():
+    os.environ["AGENTIC_AUTO_JWT_SECRET"] = "x" * 48
+    sys.modules.setdefault("boto3", types.ModuleType("boto3"))
+    la = _load("agentic_core/local_auth.py", "local_auth_t")
+
+    hashed, salt = la._hash_password("correct horse battery staple")
+    assert hashed.startswith("pbkdf2_sha256$"), f"not PBKDF2: {hashed[:24]}"
+    assert la._PBKDF2_ITERATIONS >= 210_000, "iteration count below OWASP guidance"
+    assert la._verify_password("correct horse battery staple", hashed, salt)
+    assert not la._verify_password("wrong", hashed, salt)
+    assert not la._needs_rehash(hashed)
+
+    legacy_salt = "00112233445566778899aabbccddeeff"
+    legacy = hashlib.sha256(f"{legacy_salt}:hunter2".encode()).hexdigest()
+    assert la._verify_password("hunter2", legacy, legacy_salt), "existing accounts locked out"
+    assert not la._verify_password("nope", legacy, legacy_salt)
+    assert la._needs_rehash(legacy), "legacy hash not marked for upgrade"
+
+    assert not la._verify_password("x", "", "s")
+    assert not la._verify_password("x", "pbkdf2_sha256$notanint$ff", "s")
+
+
+@check("local_auth defines the logger it uses")
+def _():
+    # _ensure_admin called logger.warning() in a module that never imported
+    # logging, so a deployment without AGENTIC_AUTO_ADMIN_PASSWORD raised
+    # NameError on the first login instead of warning.
+    os.environ["AGENTIC_AUTO_JWT_SECRET"] = "x" * 48
+    sys.modules.setdefault("boto3", types.ModuleType("boto3"))
+    la = _load("agentic_core/local_auth.py", "local_auth_t2")
+    assert hasattr(la, "logger"), "local_auth has no logger"
+
+
+# ──────────────────────── read-only SQL guard ────────────────────────
+
+@check("only a single SELECT or WITH statement may be dry-run")
+def _():
+    import re as _re
+    src = _source("agentic_core/db_engine.py")
+    chunk = src[src.index("_SQL_COMMENT = re.compile"):src.index("def resolve_private_key_path")]
+    ns = {"re": _re}
+    exec(compile(chunk, "db_engine_guard", "exec"), ns)
+    guard = ns["ensure_read_only_query"]
+
+    for sql in ("SELECT * FROM orders", "WITH t AS (SELECT 1) SELECT * FROM t",
+                "  select a from b ;  ", "(SELECT 1)"):
+        guard(sql)
+
+    for sql, label in [
+        ("SELECT 1; DROP TABLE users", "a second statement"),
+        ("/*x*/DROP TABLE users", "a DROP hidden behind a block comment"),
+        ("-- ok\nDELETE FROM orders", "a DELETE hidden behind a line comment"),
+        ("CREATE TABLE AS SELECT * FROM x", "CREATE TABLE AS SELECT"),
+        ("INSERT INTO t VALUES (1)", "INSERT"),
+        ("UPDATE t SET a=1", "UPDATE"),
+        ("", "an empty statement"),
+    ]:
+        try:
+            guard(sql)
+        except ValueError:
+            continue
+        raise AssertionError(f"{label} was allowed")
+
+
+@check("the SQL dry-run path applies the guard before choosing an engine")
+def _():
+    src = _source("agentic_core/vqr.py")
+    fn = src[src.index("def _verify_sql_execution"):]
+    fn = fn[:fn.index("\ndef ", 1)] if "\ndef " in fn[1:] else fn
+    guard_at = fn.find("ensure_read_only_query")
+    first_engine = fn.find('if engine == "postgresql"')
+    assert guard_at != -1, "no read-only guard in _verify_sql_execution"
+    assert guard_at < first_engine, "the guard runs after an engine branch is chosen"
+
+
+# ──────────────────────── private key path ────────────────────────
+
+@check("a private key path outside the configured directory is refused")
+def _():
+    import re as _re
+    src = _source("agentic_core/db_engine.py")
+    chunk = src[src.index("def resolve_private_key_path"):src.index("class SQLEngine")]
+    ns = {"os": os, "re": _re}
+    exec(compile(chunk, "db_engine_keypath", "exec"), ns)
+    resolve = ns["resolve_private_key_path"]
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as root:
+        inside = os.path.join(root, "snowflake.pem")
+        with open(inside, "w") as fh:
+            fh.write("x")
+        os.environ["AGENTIC_AUTO_KEY_DIR"] = root
+        try:
+            assert resolve(inside) == os.path.realpath(inside)
+            for bad, label in [("/etc/passwd", "an unrelated absolute path"),
+                               (os.path.join(root, "..", "escape.pem"), "a traversal"),
+                               (root + "-evil/key.pem", "a sibling with a shared prefix")]:
+                try:
+                    resolve(bad)
+                except ValueError:
+                    continue
+                raise AssertionError(f"{label} was accepted")
+            try:
+                resolve("")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("an empty path was accepted")
+        finally:
+            os.environ.pop("AGENTIC_AUTO_KEY_DIR", None)
+
+
+print()
+if FAILED:
+    print(f"{len(FAILED)} FAILED: {FAILED}")
+    sys.exit(1)
+print(f"All {len(PASSED)} hardening checks passed.")

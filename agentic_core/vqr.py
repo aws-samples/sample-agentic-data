@@ -411,6 +411,17 @@ def _verify_sql_execution(sql: str, engine: str) -> dict:
     import os
     result = {"executable": False, "row_count": 0, "error": None, "sample": None}
 
+    # The statement here is model-generated, and this function runs it for real
+    # against three engines. Only the PostgreSQL branch opened a read-only
+    # session; the Athena and Snowflake branches would have executed a
+    # CREATE TABLE AS or an INSERT. Check once, before choosing a branch.
+    from agentic_core.db_engine import ensure_read_only_query
+    try:
+        ensure_read_only_query(sql)
+    except ValueError as exc:
+        result["error"] = str(exc)
+        return result
+
     try:
         if engine == "postgresql":
             import psycopg2

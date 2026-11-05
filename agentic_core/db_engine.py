@@ -23,6 +23,74 @@ def _safe_identifier(name: str) -> str:
     return name
 
 
+# Comment forms that can hide a keyword from a naive prefix check:
+# -- to end of line, and /* ... */ anywhere.
+_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def strip_sql_comments(sql: str) -> str:
+    return _SQL_COMMENT.sub(" ", sql or "")
+
+
+def ensure_read_only_query(sql: str) -> str:
+    """Return the statement if it is a single read-only query; raise ValueError if not.
+
+    Checking `sql.upper().startswith("DROP ")` -- the pattern used elsewhere in
+    this package -- misses both of the ways this actually gets through:
+    a leading comment (`/*x*/DROP TABLE t`) and a second statement
+    (`SELECT 1; DROP TABLE t`). So comments are removed first, then the statement
+    count is checked, and only then the leading keyword.
+
+    An allowlist rather than a blocklist: a read path has no reason to begin with
+    anything but SELECT or WITH, and a blocklist has to be complete to work.
+    """
+    if not sql or not str(sql).strip():
+        raise ValueError("Empty SQL statement")
+
+    stripped = strip_sql_comments(str(sql)).strip()
+    # A trailing semicolon is normal; anything after it is a second statement.
+    statements = [part for part in stripped.rstrip(";").split(";") if part.strip()]
+    if len(statements) > 1:
+        raise ValueError("Only a single SQL statement may be executed")
+    if not statements:
+        raise ValueError("Empty SQL statement")
+
+    first = statements[0].lstrip("( \t\r\n")
+    keyword = re.match(r"[A-Za-z]+", first)
+    if not keyword or keyword.group(0).upper() not in ("SELECT", "WITH"):
+        found = keyword.group(0).upper() if keyword else "?"
+        raise ValueError(f"Only SELECT and WITH statements may be executed, not {found}")
+    return str(sql).strip()
+
+
+def resolve_private_key_path(path: str) -> str:
+    """Return a vetted absolute path to a private key file, or raise ValueError.
+
+    The path arrives in a data-source config, so it is operator-supplied rather
+    than arbitrary-caller-supplied -- and registering a data source now requires
+    an administrator. It is still worth confining: an operator can set
+    AGENTIC_AUTO_KEY_DIR and have every key path checked against it, which turns
+    a free-form filesystem read into one directory. With the variable unset the
+    behaviour is unchanged apart from the checks below.
+    """
+    if not path:
+        raise ValueError("No private key path configured")
+    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    if not os.path.isabs(resolved):
+        raise ValueError("Private key path must be absolute")
+
+    key_dir = os.environ.get("AGENTIC_AUTO_KEY_DIR", "").strip()
+    if key_dir:
+        root = os.path.realpath(os.path.expanduser(key_dir))
+        # commonpath, not startswith: "/keys-evil" startswith "/keys".
+        if os.path.commonpath([root, resolved]) != root:
+            raise ValueError("Private key path is outside AGENTIC_AUTO_KEY_DIR")
+
+    if not os.path.isfile(resolved):
+        raise ValueError("Private key path is not a regular file")
+    return resolved
+
+
 class SQLEngine(ABC):
     """Abstract base for SQL data sources."""
     name: str = "unknown"
@@ -127,10 +195,22 @@ class SnowflakeEngine(SQLEngine):
               "warehouse": self.warehouse, "database": self.database,
               "schema": self.schema, "login_timeout": 15, "network_timeout": 30}
 
-        if self.private_key_path and os.path.exists(self.private_key_path):
+        # A bad key path used to fall through to password auth silently. The
+        # fallback is kept so a stale path does not break a working deployment,
+        # but it is no longer silent, and the path itself is now vetted.
+        key_path = None
+        if self.private_key_path:
+            try:
+                key_path = resolve_private_key_path(self.private_key_path)
+            except ValueError as exc:
+                if not self.password:
+                    raise
+                logger.warning("Ignoring configured private key path (%s); using password auth", exc)
+
+        if key_path:
             from cryptography.hazmat.backends import default_backend
             from cryptography.hazmat.primitives import serialization
-            with open(self.private_key_path, "rb") as f:
+            with open(key_path, "rb") as f:
                 p_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
             kw["private_key"] = p_key.private_bytes(
                 encoding=serialization.Encoding.DER,

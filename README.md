@@ -6,7 +6,7 @@
 
 > ## ⚠️ 安全公告 / Security Notice
 >
-> **早于 `v1.0.1` 的版本含有一个 Critical 级别的认证缺陷，请勿部署。**
+> **早于 `v1.0.2` 的版本含有多个 Critical 级别缺陷，请勿部署。**
 >
 > 认证默认为关闭（`AGENTIC_AUTO_AUTH_ENABLED` 默认 `false`），而随仓库提供的 CDK
 > 栈从未设置该变量。在该状态下，中间件为**每一个请求**注入 `role: "admin"` 身份，
@@ -16,10 +16,15 @@
 > 此问题由外部研究者通过 AWS Vulnerability Reporting Program 报告，CVSS 3.1 评分 **9.8
 > (Critical)**，CWE-306 / CWE-1188。
 >
+> `v1.0.2` 另外修复了：`POST /api/mcp/test` 会执行请求体里指定的命令（任务角色权限下的
+> 任意命令执行）；六个接口会去抓取请求体里指定的 URL，在 Fargate 上可读取
+> `169.254.170.2` 上的任务角色凭证；`authing` 认证路径完全不验签，可伪造任意用户登录。
+>
 > **如果你已经部署了旧版本：**
 > 1. 立即限制负载均衡器的入站访问，或将其改为内网（internal）。
-> 2. 升级到 `v1.0.1` 或更新，并在部署时显式传入 `AllowedCIDRs` 和 `JwtSigningSecret`。
+> 2. 升级到 `v1.0.2` 或更新，并在部署时显式传入 `AllowedCIDRs` 和 `JwtSigningSecret`。
 > 3. 审查负载均衡器和应用日志，排查未经授权的访问。
+> 4. 轮换该部署用过的全部凭证 —— 任务角色、数据源密码、模型 API key。
 >
 > 已修复的内容见 [SECURITY.md](SECURITY.md)。问题报告请发至 aws-security@amazon.com。
 

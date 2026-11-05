@@ -6,8 +6,8 @@
 
 > ## ⚠️ Security Notice
 >
-> **Do not deploy any version earlier than `v1.0.1`. It contains a Critical
-> authentication defect.**
+> **Do not deploy any version earlier than `v1.0.2`. Earlier versions contain
+> several Critical defects.**
 >
 > Authentication defaulted to off (`AGENTIC_AUTO_AUTH_ENABLED` defaulted to `false`)
 > and the CDK stack shipped in this repository never set that variable. In that state
@@ -18,11 +18,19 @@
 > Reported by an external researcher through the AWS Vulnerability Reporting Program.
 > CVSS 3.1 score **9.8 (Critical)**, CWE-306 / CWE-1188.
 >
+> `v1.0.2` additionally fixes: `POST /api/mcp/test` executed a command named in the
+> request body, which is arbitrary command execution as the task role; six endpoints
+> fetched a URL named in the request body and returned the response, which on Fargate
+> reads the task role's credentials from `169.254.170.2`; and the `authing`
+> authentication path verified no signature at all, so any user could be impersonated.
+>
 > **If you have already deployed an earlier version:**
 > 1. Restrict ingress to the load balancer immediately, or make it internal.
-> 2. Upgrade to `v1.0.1` or later and supply `AllowedCIDRs` and `JwtSigningSecret`
+> 2. Upgrade to `v1.0.2` or later and supply `AllowedCIDRs` and `JwtSigningSecret`
 >    explicitly at deploy time.
 > 3. Review load balancer and application logs for unauthorised access.
+> 4. Rotate every credential that deployment held — the task role, data-source
+>    passwords and model API keys.
 >
 > See [SECURITY.md](SECURITY.md) for what changed. Report issues to
 > aws-security@amazon.com.

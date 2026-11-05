@@ -1,6 +1,6 @@
 """
 Local JWT Authentication — Cognito-free auth for China region.
-Users stored in DynamoDB config table. Passwords hashed with bcrypt.
+Users stored in DynamoDB config table. Passwords hashed with PBKDF2-HMAC-SHA256.
 """
 import json
 import time
@@ -8,9 +8,12 @@ import hashlib
 import hmac
 import base64
 import os
+import logging
 import boto3
 
 from config import CONFIG_TABLE, REGION
+
+logger = logging.getLogger(__name__)
 
 # No default. A shipped default secret is a published signing key: anyone reading
 # this repository could mint a valid token. Absent configuration we refuse to start
@@ -57,17 +60,44 @@ def _jwt_decode(token: str) -> dict:
     return payload
 
 
-# ── Password hashing (SHA-256 + salt, no bcrypt dependency) ──
+# ── Password hashing (PBKDF2-HMAC-SHA256, stdlib) ──
+#
+# Was a single round of salted SHA-256. SHA-256 is built to be fast, which is the
+# opposite of what password storage needs: commodity hardware tries it billions of
+# times a second, so a stolen hash table is a stolen password list. PBKDF2 is in
+# the standard library, so this needs no new dependency.
+#
+# Iteration count follows OWASP guidance for PBKDF2-HMAC-SHA256. Measured at
+# roughly 46 ms per verification, which is a login-path cost, not a per-request one.
+_PBKDF2_ITERATIONS = 600_000
+_PBKDF2_PREFIX = "pbkdf2_sha256$"
+
 
 def _hash_password(password: str, salt: str = None) -> tuple:
     if salt is None:
         salt = os.urandom(16).hex()
-    hashed = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    return hashed, salt
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PBKDF2_ITERATIONS)
+    return f"{_PBKDF2_PREFIX}{_PBKDF2_ITERATIONS}${dk.hex()}", salt
+
 
 def _verify_password(password: str, hashed: str, salt: str) -> bool:
-    check, _ = _hash_password(password, salt)
-    return hmac.compare_digest(check, hashed)
+    if not hashed:
+        return False
+    if hashed.startswith(_PBKDF2_PREFIX):
+        try:
+            _, iterations, digest = hashed.split("$", 2)
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iterations))
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(dk.hex(), digest)
+    # Legacy single-round hash. Still accepted so existing accounts keep working;
+    # local_login upgrades the stored hash on the next successful login.
+    legacy = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    return hmac.compare_digest(legacy, hashed)
+
+
+def _needs_rehash(hashed: str) -> bool:
+    return not str(hashed or "").startswith(_PBKDF2_PREFIX)
 
 
 # ── User Storage (DynamoDB config table) ──
@@ -130,6 +160,18 @@ def local_login(email: str, password: str) -> dict:
         return {"error": "用户不存在"}
     if not _verify_password(password, user["password_hash"], user["password_salt"]):
         return {"error": "密码错误"}
+
+    # Upgrade a legacy single-round hash now that we hold the plaintext. Failing
+    # to persist the upgrade must not fail the login.
+    if _needs_rehash(user.get("password_hash", "")):
+        try:
+            new_hash, new_salt = _hash_password(password)
+            users[email]["password_hash"] = new_hash
+            users[email]["password_salt"] = new_salt
+            _save_users(users)
+            logger.info("Upgraded a stored password hash to PBKDF2")
+        except Exception as exc:
+            logger.warning("Password hash upgrade failed, login still allowed: %s", exc)
     
     token = _jwt_encode({
         "sub": email,

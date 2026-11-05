@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -20,9 +20,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import AuthMiddleware, get_current_user, check_rate_limit, _decode_jwt_payload
+# Claims are read only from a verified token. The decoder this module used to
+# import read the payload without checking the signature; it is gone.
+from auth import (
+    AuthMiddleware, get_current_user, check_rate_limit, require_admin,
+    _verify_cognito_token,
+)
 from agentic_core.user_memory import load_user_memory, save_user_memory, format_memory_for_prompt, extract_memory_from_conversation
 from agentic_core.db_engine import _safe_identifier as _safe_id
+# Caller-supplied URLs are resolved and checked before the server fetches them.
+# On Fargate an unguarded fetch reaches the task role's credentials at
+# 169.254.170.2 and returns them in the response body.
+from agentic_core.net_guard import safe_urlopen, validate_outbound_url
 from config import (REGION, EVENTS_TABLE, DATA_BUCKET, REPORTS_BUCKET,
     CHAT_TABLE, COST_TABLE, CONFIG_TABLE, FEEDBACK_TABLE,
     AUTH_ENABLED, COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION,
@@ -2054,7 +2063,7 @@ def api_list_models():
     }
 
 @app.post("/api/models/custom")
-def api_add_custom_model(req: dict):
+def api_add_custom_model(req: dict, _admin: dict = Depends(require_admin)):
     """Add any model — Bedrock or third-party (OpenAI-compatible, Ollama, etc.)."""
     from agentic_core import reload_models
     _load_custom_models()
@@ -2089,7 +2098,7 @@ def api_add_custom_model(req: dict):
     return {"status": "ok", "model": name}
 
 @app.delete("/api/models/custom/{name}")
-def api_del_custom_model(name: str):
+def api_del_custom_model(name: str, _admin: dict = Depends(require_admin)):
     from agentic_core import reload_models
     _load_custom_models()
     _custom_models[:] = [m for m in _custom_models if m["name"] != name]
@@ -2098,7 +2107,7 @@ def api_del_custom_model(name: str):
     return {"status": "ok"}
 
 @app.post("/api/models/test")
-def api_test_model(req: dict):
+def api_test_model(req: dict, _admin: dict = Depends(require_admin)):
     """Test connection to a model endpoint."""
     endpoint = req.get("endpoint", "").strip().rstrip("/")
     api_key = req.get("api_key", "")
@@ -2163,10 +2172,9 @@ def api_test_model(req: dict):
                 "messages": [{"role": "user", "content": "Say ok"}],
                 "max_tokens": 16, "temperature": 0,
             }).encode()
-            if not str(url).startswith(("http://", "https://")):
-                raise ValueError("URL must use http:// or https://")
+            url = validate_outbound_url(url)
             r = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            resp = urllib.request.urlopen(r, timeout=15)  # nosec B310
+            resp = safe_urlopen(r, timeout=15)
             data = _j.loads(resp.read())
             elapsed = round((_time.time() - start) * 1000)
             reply = data.get("choices", [{}])[0].get("message", {}).get("content", "")[:50]
@@ -2178,10 +2186,9 @@ def api_test_model(req: dict):
             headers = {"Content-Type": "application/json"}
             import json as _j
             body = _j.dumps({"model": model_id, "prompt": "Say ok", "stream": False}).encode()
-            if not str(url).startswith(("http://", "https://")):
-                raise ValueError("URL must use http:// or https://")
+            url = validate_outbound_url(url)
             r = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            resp = urllib.request.urlopen(r, timeout=30)  # nosec B310
+            resp = safe_urlopen(r, timeout=30)
             data = _j.loads(resp.read())
             elapsed = round((_time.time() - start) * 1000)
             reply = data.get("response", "")[:50]
@@ -2267,7 +2274,7 @@ def _boto3_resource(service, config):
     return boto3.resource(service, **_resolve_aws_creds(config))
 
 @app.post("/api/datasources/test")
-def api_datasource_test(req: dict):
+def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
     ds_type = req.get("type", "")
     config = req.get("config", {})
     # Support passing full datasource object (from card test button)
@@ -2461,7 +2468,7 @@ def api_datasource_test(req: dict):
                 import json as _j
                 url = domain.rstrip("/") + "/_cat/indices?format=json"
                 req = Request(url, headers={"Content-Type": "application/json"})
-                resp = urlopen(req, timeout=10)  # nosec B310
+                resp = safe_urlopen(req, timeout=10)
                 indices = _j.loads(resp.read())
                 names = [idx["index"] for idx in indices if not idx["index"].startswith(".")]
                 return {"ok": True, "message": f"连接成功 — {len(names)} 个索引", "indices": names[:20]}
@@ -2473,7 +2480,7 @@ def api_datasource_test(req: dict):
         return {"ok": False, "message": f"连接失败: {str(e)}"}
 
 @app.put("/api/datasources/{ds_id}")
-def api_update_datasource(ds_id: str, req: dict):
+def api_update_datasource(ds_id: str, req: dict, _admin: dict = Depends(require_admin)):
     """Edit an existing datasource — update any provided fields."""
     global _custom_data_sources
     _custom_data_sources = _load_config("custom_datasources", [])
@@ -2499,7 +2506,7 @@ def api_update_datasource(ds_id: str, req: dict):
     return {"ok": True, "source": found}
 
 @app.post("/api/datasources")
-def api_add_datasource(req: dict):
+def api_add_datasource(req: dict, _admin: dict = Depends(require_admin)):
     ds = {
         "id": f"custom-{uuid.uuid4().hex[:8]}",
         "name": req.get("name", "自定义数据源"),
@@ -2520,7 +2527,7 @@ def api_add_datasource(req: dict):
     return {"ok": True, "source": ds}
 
 @app.delete("/api/datasources/{ds_id}")
-def api_delete_datasource(ds_id: str):
+def api_delete_datasource(ds_id: str, _admin: dict = Depends(require_admin)):
     global _custom_data_sources
 
     # Find the datasource before removing
@@ -3119,7 +3126,7 @@ def api_list_mcp():
     return {"builtin": builtin, "external": _ext_mcp_servers}
 
 @app.post("/api/mcp/servers")
-def api_add_mcp(req: dict):
+def api_add_mcp(req: dict, _admin: dict = Depends(require_admin)):
     """Add an external MCP server."""
     _load_ext_mcp()
     name = req.get("name", "").strip()
@@ -3154,14 +3161,14 @@ def api_add_mcp(req: dict):
     return {"status": "ok", "server": name}
 
 @app.delete("/api/mcp/servers/{name}")
-def api_del_mcp(name: str):
+def api_del_mcp(name: str, _admin: dict = Depends(require_admin)):
     _load_ext_mcp()
     _ext_mcp_servers[:] = [s for s in _ext_mcp_servers if s["name"] != name]
     _save_ext_mcp()
     return {"status": "ok"}
 
 @app.post("/api/mcp/test")
-def api_test_mcp(req: dict):
+def api_test_mcp(req: dict, _admin: dict = Depends(require_admin)):
     """Test connection to an MCP server (SSE/Streamable HTTP)."""
     import urllib.request, urllib.error
     transport = req.get("transport", "sse")
@@ -3173,38 +3180,22 @@ def api_test_mcp(req: dict):
     
     try:
         if transport == "stdio":
-            # Test stdio: try to run the command and see if it starts
-            import subprocess
-            args = req.get("args", [])
-            cmd = [command] + args if args else [command]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, env={**os.environ, **req.get("env", {})})
-            # Send initialize request (JSON-RPC)
-            import json as _j
-            init_msg = _j.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}})
-            try:
-                proc.stdin.write((init_msg + "\n").encode())
-                proc.stdin.flush()
-                import select
-                ready, _, _ = select.select([proc.stdout], [], [], 5)
-                if ready:
-                    line = proc.stdout.readline().decode().strip()
-                    elapsed = round((_time.time() - start) * 1000)
-                    data = _j.loads(line) if line else {}
-                    tools_info = data.get("result", {}).get("capabilities", {})
-                    proc.kill()
-                    return {"status": "ok", "latency_ms": elapsed, "message": "stdio 进程启动成功", "capabilities": tools_info}
-                else:
-                    proc.kill()
-                    elapsed = round((_time.time() - start) * 1000)
-                    return {"status": "ok", "latency_ms": elapsed, "message": "进程启动成功 (无初始化响应，可能需要 header)"}
-            finally:
-                try: proc.kill()
-                except: pass
-        
+            # Removed. This branch ran subprocess.Popen([command] + args) with the
+            # command, its arguments and its environment all taken from the request
+            # body, which is arbitrary command execution as the task role -- and
+            # merely allow-listing the command would not have closed it, because the
+            # caller-supplied env carried LD_PRELOAD. A server cannot test a stdio
+            # MCP server on the caller's behalf; stdio servers are launched by the
+            # client, so test them where they run.
+            return JSONResponse(
+                {"status": "error",
+                 "message": "stdio 传输无法从服务端测试：服务端不会执行请求中提供的命令。"
+                            "请在运行该 MCP server 的客户端本地测试。"},
+                400,
+            )
+
         elif transport == "sse":
-            if not str(endpoint).startswith(("http://", "https://")):
-                raise ValueError("URL must use http:// or https://")
-            r = urllib.request.urlopen(endpoint, timeout=5)  # nosec B310
+            r = safe_urlopen(endpoint, timeout=5)
             elapsed = round((_time.time() - start) * 1000)
             ct = r.headers.get("Content-Type", "")
             return {"status": "ok", "latency_ms": elapsed, "message": f"SSE 连接成功 (Content-Type: {ct})"}
@@ -3213,10 +3204,9 @@ def api_test_mcp(req: dict):
             import json as _j
             # Send initialize via HTTP POST
             init_body = _j.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}).encode()
-            if not str(endpoint).startswith(("http://", "https://")):
-                raise ValueError("URL must use http:// or https://")
+            endpoint = validate_outbound_url(endpoint)
             r = urllib.request.Request(endpoint, data=init_body, headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream"}, method="POST")
-            resp = urllib.request.urlopen(r, timeout=10)  # nosec B310
+            resp = safe_urlopen(r, timeout=10)
             elapsed = round((_time.time() - start) * 1000)
             body = resp.read().decode()[:300]
             return {"status": "ok", "latency_ms": elapsed, "message": "HTTP 连接成功", "response": body}
@@ -3235,7 +3225,7 @@ def api_test_mcp(req: dict):
         return JSONResponse({"status": "error", "message": f"错误: {str(e)[:150]}"}, 200)
 
 @app.post("/api/mcp/tools")
-def api_list_mcp_tools(req: dict):
+def api_list_mcp_tools(req: dict, _admin: dict = Depends(require_admin)):
     """List tools from an external MCP server (SSE only for now)."""
     endpoint = req.get("endpoint", "").strip()
     if not endpoint:
@@ -3244,9 +3234,7 @@ def api_list_mcp_tools(req: dict):
         # For SSE servers, call the tools/list endpoint
         import json as _j
         tools_url = endpoint.replace("/sse", "/tools/list") if "/sse" in endpoint else endpoint + "/tools/list"
-        if not str(tools_url).startswith(("http://", "https://")):
-            raise ValueError("URL must use http:// or https://")
-        r = urllib.request.urlopen(tools_url, timeout=10)  # nosec B310
+        r = safe_urlopen(tools_url, timeout=10)
         data = _j.loads(r.read())
         tools = data.get("tools", data) if isinstance(data, dict) else data
         return {"status": "ok", "tools": tools}
@@ -3945,7 +3933,7 @@ def api_login(req: LoginRequest):
         from agentic_core.cognito_auth import login
         result = login(req.email, req.password)
         if result.get("ok"):
-            payload = _decode_jwt_payload(result["id_token"])
+            payload = _verify_cognito_token(result["id_token"])
             result["user"] = {
                 "email": payload.get("email", req.email),
                 "role": payload.get("custom:role", "viewer"),
@@ -4023,12 +4011,16 @@ def api_auth_callback(body: dict):
     }).encode()
     req = urllib.request.Request(token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310
+        # COGNITO_DOMAIN is configuration, not caller input, so this is not the
+        # forgery primitive the test endpoints were. It goes through the same
+        # guard anyway: that leaves one rule to check -- no raw urlopen on a URL
+        # that is not a literal -- instead of a rule plus an exemption list.
+        with safe_urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read())
         id_token = result.get("id_token", "")
         access_token = result.get("access_token", "")
         refresh_token = result.get("refresh_token", "")
-        payload = _decode_jwt_payload(id_token)
+        payload = _verify_cognito_token(id_token)
         return {
             "ok": True,
             "access_token": access_token,
@@ -4468,7 +4460,7 @@ def api_list_staging():
 # ─── Auto-Discovery: Connect → Introspect → Semantic Layer ──
 
 @app.post("/api/datasources/connect")
-def api_connect_datasource(req: dict):
+def api_connect_datasource(req: dict, _admin: dict = Depends(require_admin)):
     """
     一键连接数据源: 测试连接 → 自动探查 Schema → 推断语义层 → 返回预览。
     
@@ -4733,7 +4725,7 @@ _introspection_staging = {}
 
 
 @app.post("/api/datasources/connect/apply")
-def api_apply_introspection(req: dict):
+def api_apply_introspection(req: dict, _admin: dict = Depends(require_admin)):
     """
     应用自动发现的语义层定义。
     

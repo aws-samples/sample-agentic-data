@@ -60,8 +60,11 @@ signed token is still accepted and a tampered one is not.
 
 ```bash
 pip install -r requirements.txt
-AGENTIC_AUTO_JWT_SECRET=$(openssl rand -base64 48) python -m pytest tests/test_auth_regression.py -v
+AGENTIC_AUTO_JWT_SECRET=$(openssl rand -base64 48) python tests/test_auth_regression.py
 ```
+
+Both suites in `tests/` are self-contained scripts that exit non-zero on failure.
+Run them directly; `pytest` cannot collect them.
 
 ### Deploying safely
 
@@ -75,3 +78,149 @@ npx cdk deploy \
 
 The load balancer is internal unless you pass both
 `-c publicly_accessible=true` and `-c certificate_arn=<acm-arn>`.
+
+## Fixed in v1.0.2 — command execution, request forgery and an unverified token path
+
+Found by static analysis (CodeQL) and by reviewing the first remediation, not by
+an external report. Six findings were rated Critical by CodeQL; the most serious
+one here was rated nothing at all, because it is a logic flaw rather than a taint
+flow.
+
+### Remote command execution — `POST /api/mcp/test`
+
+The `stdio` branch ran:
+
+```python
+proc = subprocess.Popen([command] + args, ..., env={**os.environ, **req.get("env", {})})
+```
+
+with `command`, `args` and `env` all taken from the request body. That is
+arbitrary command execution as the Fargate task role. Allow-listing `command`
+would not have closed it, because the caller also supplied the environment and
+therefore `LD_PRELOAD`.
+
+The branch is gone. It now answers `400`. A server cannot test a stdio MCP server
+on a caller's behalf: stdio servers are started by the client, so they are tested
+where they run.
+
+### Server-side request forgery — six endpoints
+
+`POST /api/models/test`, `POST /api/datasources/test`, `POST /api/mcp/test` and
+`POST /api/mcp/tools` fetched a URL supplied in the request body and returned the
+response body to the caller. On ECS and Fargate that is credential disclosure,
+not just reachability: the task role's keys are served over plain HTTP from
+`169.254.170.2` and instance metadata from `169.254.169.254`.
+
+The existing check was `url.startswith(("http://", "https://"))`, which both of
+those URLs satisfy.
+
+`agentic_core/net_guard.py` now gates every fetch of a caller-supplied URL:
+
+| | |
+|---|---|
+| Scheme | `http` and `https` only |
+| Userinfo | rejected — `http://user:pass@host/` |
+| Address | **every** address the name resolves to is checked, not just the first |
+| Always blocked | loopback, link-local (`169.254.0.0/16`, `fe80::/10`), multicast, reserved, unspecified |
+| IPv6 embedding | `::ffff:169.254.169.254` and 6to4/Teredo forms are reduced to the embedded IPv4 address before checking |
+| Private ranges | blocked unless `AGENTIC_AUTO_ALLOW_PRIVATE_EGRESS=true`, for a self-hosted model endpoint inside the VPC. That opt-in does **not** unblock link-local. |
+| Redirects | refused, not followed — a validated public URL answering `302` with a metadata address would otherwise defeat the address check |
+| Response size | capped at 10 MB |
+
+**Residual risk, stated rather than hidden:** validation resolves the hostname
+and the connection resolves it again, so a name that returns different answers
+between the two (DNS rebinding) is not covered. Closing that requires pinning the
+connection to the validated address, which `urllib` does not expose. Refusing
+redirects is what keeps the remaining window narrow.
+
+### Authentication bypass on the Authing provider — not flagged by any scanner
+
+`agentic_core/authing_auth.py` had its own copy of the unverified decoder that
+the first pass removed from `auth.py`:
+
+```python
+def _decode_jwt_payload(token):
+    return json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
+```
+
+`verify_token()` called it, compared `exp`, and returned the claims. With
+`AGENTIC_AUTO_AUTH_PROVIDER=authing`, anyone could base64-encode
+`{"email": "<a known admin>", "exp": <future>}`, append arbitrary bytes as a
+signature, and be authenticated as that user. `exp` was whatever they chose to
+put there. This is the same missing-verification class as the originally reported
+finding, on a different provider path, and no scanner flagged it.
+
+Tokens are now verified against Authing's JWKS (RS256, issuer and audience from
+the OIDC discovery document). Discovery or JWKS failure refuses the token rather
+than falling back to reading it.
+
+### Authorization — the middleware authenticated but never authorized
+
+`require_admin()` existed and was called from nowhere. Any authenticated
+viewer could register or delete a model endpoint, a data source or an MCP server,
+and reach the command-execution and metadata paths above.
+
+Thirteen configuration endpoints now depend on `require_admin`:
+`/api/models/custom` (POST, DELETE), `/api/models/test`, `/api/datasources`
+(POST, PUT, DELETE), `/api/datasources/test`, `/api/datasources/connect`,
+`/api/datasources/connect/apply`, `/api/mcp/servers` (POST, DELETE),
+`/api/mcp/test`, `/api/mcp/tools`.
+
+**This is a behavioural change.** With authentication enabled, these endpoints
+now require an account whose role is `admin`. Set `AGENTIC_AUTO_ADMIN_PASSWORD`
+at deploy time; `admin@agentic-data.com` is created on first login.
+
+### Password storage
+
+`local_auth.py` hashed passwords with a single round of salted SHA-256, while its
+own docstring claimed bcrypt. SHA-256 is built to be fast, which is the opposite
+of what password storage needs.
+
+Now PBKDF2-HMAC-SHA256 at 600,000 iterations (OWASP guidance, standard library,
+no new dependency) — about 46 ms per verification. **Existing accounts keep
+working:** a legacy hash is still accepted, and the stored hash is upgraded in
+place on the next successful login.
+
+### Also fixed in this pass
+
+| File | Issue |
+|---|---|
+| `api/main.py` | **The application could not start.** The first remediation deleted `_decode_jwt_payload` from `auth.py` and left `from auth import ... _decode_jwt_payload` in place, so importing the app raised `ImportError`. Both call sites now use the verified decoder. |
+| `agentic_core/local_auth.py` | `_ensure_admin()` called `logger.warning()` in a module that never imported `logging`, so a deployment without `AGENTIC_AUTO_ADMIN_PASSWORD` raised `NameError` on the first login instead of warning. |
+| `agentic_core/vqr.py` | `_verify_sql_execution()` executes model-generated SQL for real against three engines. Only the PostgreSQL branch opened a read-only session; the Athena and Snowflake branches would have run a `CREATE TABLE AS` or an `INSERT`. A single read-only statement is now required for all three. |
+| `agentic_core/db_engine.py` | New `ensure_read_only_query()`: strips comments, rejects a second statement, requires `SELECT` or `WITH`. The pattern used elsewhere in this package, `sql.upper().startswith("DROP ")`, misses both `/*x*/DROP TABLE t` and `SELECT 1; DROP TABLE t`. |
+| `agentic_core/db_engine.py` | A Snowflake `private_key_path` from a data-source config was opened directly. It is now resolved and, if `AGENTIC_AUTO_KEY_DIR` is set, confined to that directory. A bad path still falls back to password auth so a stale config does not break a working deployment, but the fallback is logged. |
+| `agentic_core/authing_auth.py` | Logged the email address of every auto-created SSO user in clear text. |
+
+### Assessed and deliberately not changed
+
+CodeQL reports `py/sql-injection` at the `SELECT COUNT(*)` calls in
+`api/main.py`. Those interpolate only identifiers, and every one passes through
+`_safe_identifier()`, which enforces `^[a-zA-Z_][a-zA-Z0-9_.]*$`. The sanitizer
+is correct; CodeQL does not model it. These are false positives and are left in
+place rather than worked around.
+
+### Verifying
+
+```bash
+python tests/test_hardening_regression.py   # 22 checks
+python tests/test_auth_regression.py        #  9 checks
+```
+
+The request-forgery, SQL and password guards are imported and called for real.
+The endpoint-level facts — that no process spawn remains, that every
+caller-supplied fetch goes through the guard, and that each of the thirteen
+configuration endpoints carries the dependency — are asserted against the source
+with `ast`, because importing `api/main.py` needs the full runtime.
+
+One of those checks exists because of the `ImportError` above: it parses every
+name `api/main.py` imports from `auth.py` and asserts `auth.py` defines it.
+
+### New environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AGENTIC_AUTO_ALLOW_PRIVATE_EGRESS` | unset | `true` permits outbound requests to private ranges, for a model endpoint inside the VPC. Never permits link-local. |
+| `AGENTIC_AUTO_KEY_DIR` | unset | When set, a Snowflake `private_key_path` must resolve inside this directory. |
+
+Both default to the secure behaviour, so no infrastructure change is needed.
