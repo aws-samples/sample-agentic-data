@@ -107,10 +107,15 @@ check("the task sets AGENTIC_AUTO_AUTH_ENABLED=true",
 check("the task sets AGENTIC_DATA_ENV=production",
       env.get("AGENTIC_DATA_ENV") == "production", env.get("AGENTIC_DATA_ENV"))
 
-jwt = PARAMS.get("JwtSigningSecret", {})
+jwt_param = PARAMS.get("JwtSigningSecret", {})
+jwt_facts = {
+    "no default": "Default" not in jwt_param,
+    "noEcho": jwt_param.get("NoEcho") in (True, "true"),
+    "min length 32": jwt_param.get("MinLength") == 32,
+}
 check("JwtSigningSecret is required, NoEcho, min 32",
-      "Default" not in jwt and jwt.get("NoEcho") in (True, "true") and jwt.get("MinLength") == 32,
-      {k: jwt.get(k) for k in ("Default", "NoEcho", "MinLength")})
+      all(jwt_facts.values()),
+      "failing: " + ", ".join(k for k, v in jwt_facts.items() if not v))
 
 
 # ── secrets must not be written into resource properties ────────────
