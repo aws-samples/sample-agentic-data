@@ -118,18 +118,18 @@ echo "   ✅ Image pushed"
 
 # ── Step 4: Deploy CloudFormation ──
 echo "☁️  Step 4: Deploying CloudFormation..."
-PARAMS="DeploymentMode=$MODE"
-PARAMS="$PARAMS InstanceType=$INSTANCE_TYPE"
-PARAMS="$PARAMS ContainerImageUri=$IMAGE_URI"
-PARAMS="$PARAMS SupervisorModel=$SUP_MODEL"
-PARAMS="$PARAMS SubAgentModel=$SUB_MODEL"
-[[ -n "$KEY_PAIR" ]] && PARAMS="$PARAMS KeyPairName=$KEY_PAIR"
+_PARAMS="DeploymentMode=$MODE"
+_PARAMS="$_PARAMS InstanceType=$INSTANCE_TYPE"
+_PARAMS="$_PARAMS ContainerImageUri=$IMAGE_URI"
+_PARAMS="$_PARAMS SupervisorModel=$SUP_MODEL"
+_PARAMS="$_PARAMS SubAgentModel=$SUB_MODEL"
+[[ -n "$KEY_PAIR" ]] && _PARAMS="$_PARAMS KeyPairName=$KEY_PAIR"
 
-# shellcheck disable=SC2086  # $PARAMS is intentionally unquoted for word-split (CFN Key=Value list)
+# shellcheck disable=SC2086  # $_PARAMS is intentionally unquoted for word-split (CFN Key=Value list)
 aws cloudformation deploy \
   --template-file "$SCRIPT_DIR/cfn-agentic-data.yaml" \
   --stack-name "$STACK_NAME" \
-  --parameter-overrides $PARAMS \
+  --parameter-overrides $_PARAMS \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION" \
   --no-fail-on-empty-changeset

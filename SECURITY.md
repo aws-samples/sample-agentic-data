@@ -672,7 +672,7 @@ plainly: the fix introduced them.
 
 | Finding | Was | Now |
 |---|---|---|
-| `dangerous-subprocess-use-audit` — `tests/test_cdk_hardening.py` | `subprocess.run(args, ...)` with a list built in code | Executable resolved with `shutil.which`, `shell=False` stated explicitly, argument lists are literals from the same file, and the audit rule is suppressed with that reasoning |
+| `dangerous-subprocess-use-audit` — `tests/test_cdk_hardening.py` | `subprocess.run(args, ...)` with a list built in code, in two places | Collapsed to **one** call site, `_run_synth()`. Executable resolved with `shutil.which`, `shell=False` stated explicitly, arguments are literals from the same file, and the audit rule is answered once in the place that does the work. The first attempt annotated only one of the two call sites and left the other Critical. |
 | `useless-inner-function` ×2 — `tests/test_auth_regression.py` | FastAPI handlers registered with `@app.get` / `@app.put` inside a test function. A decorator registration is not a call a scanner can see, so both read as defined-and-never-used | Registered with `app.add_api_route(path, handler, methods=[...])`. Identical behaviour, and the handlers are passed as arguments, so they are visibly used |
 
 The 22 Warnings had six distinct causes:
@@ -711,3 +711,57 @@ finding in this scan that was real and that severity would have had us skip.
 | `unquoted-variable-expansion-in-command` | 2 | The expansions are deliberately unquoted so context flags word-split into separate arguments. A bash array is the robust form and is a worthwhile change to the deploy scripts; it is not made here because those scripts cannot be exercised end to end without a deployment |
 | `dockerfile-source-not-pinned` | 1 | Pinning `FROM python:3.12-slim` to a digest fixes the image at a point in time, which for sample content means it ships a base image that stops receiving patches |
 | `prefer-json-notation` | 1 | The `CMD` is inside a `HEALTHCHECK` and uses `||`, which requires the shell form |
+
+## Fixed in v1.0.5 — two more deploy-time credentials in resource properties
+
+Found by extending the canary test written for the signing secret to every
+credential the stack accepts. Same defect class as v1.0.3, two more instances.
+
+### What was wrong
+
+Synthesising with distinctive values and searching the template for them:
+
+```
+$ cdk synth -c openai_api_key=CANARY-OPENAI \
+            -c rds_engine=postgresql -c rds_password=CANARY-RDSPW
+
+CANARY-OPENAI: TaskDef (AWS::ECS::TaskDefinition), InitDataFn (AWS::Lambda::Function)
+CANARY-RDSPW:  TaskDef (AWS::ECS::TaskDefinition), InitDataFn (AWS::Lambda::Function)
+```
+
+Both landed in the task definition's `environment` and on the init Lambda, in
+plaintext, readable with `ecs:DescribeTaskDefinition` or
+`lambda:GetFunctionConfiguration`. Task definition revisions are retained, so
+they outlive a rotation.
+
+`OPENAI_API_KEY` was the worse of the two, because **nothing read it.** No Python
+in this repository reads that variable from the environment — the application
+takes the key from the model record in DynamoDB. The task definition disclosed a
+credential no consumer wanted.
+
+### What changed
+
+- `OPENAI_API_KEY` is gone from the task definition.
+- The data-source password reaches the container through the container `secrets`
+  block, so the task definition holds only an ARN.
+- The init Lambda, which has to write both values into the config table, receives
+  `OPENAI_API_KEY_SECRET_ARN` and `RDS_PASSWORD_SECRET_ARN` and reads them at run
+  time. An ARN is safe in a function's configuration; a value is not.
+- Two new context options take an ARN directly:
+  `-c rds_password_secret_arn=<arn>` and `-c openai_api_key_secret_arn=<arn>`.
+  **These are the forms to use.** A context value is a literal at synth time, so
+  `-c rds_password=<value>` still puts the value in the synthesised template —
+  the stack wraps it in a Secrets Manager secret so it goes no further, and warns
+  at synth time that the template carries it.
+
+### Verifying
+
+`tests/test_cdk_hardening.py` is now 38 checks. Six are these, and they work by
+canary rather than by reading the TypeScript: synthesise with distinctive values,
+then assert that each appears in **no resource other than a Secrets Manager
+secret**, that no environment variable on the task is named like a credential,
+that a Lambda receives credentials only as a `*_SECRET_ARN`, and that the unread
+`OPENAI_API_KEY` variable is gone.
+
+Reading the source would not have caught this. The canary does, and it will catch
+the next one.

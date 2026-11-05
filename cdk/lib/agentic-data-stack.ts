@@ -97,6 +97,13 @@ export class AgenticDataStack extends cdk.Stack {
     const rdsDatabase = this.node.tryGetContext('rds_database') || '';
     const rdsUser = this.node.tryGetContext('rds_user') || '';
     const rdsPassword = this.node.tryGetContext('rds_password') || '';
+    // A Secrets Manager ARN is not itself a secret, so it is safe in a context
+    // value and in the template. The password is not: a context value is a
+    // literal at synth time, so -c rds_password= puts it in the synthesised
+    // template and then, resolved, in the task definition revision -- where
+    // ecs:DescribeTaskDefinition reads it and where revisions are retained.
+    const rdsPasswordSecretArn = this.node.tryGetContext('rds_password_secret_arn') || '';
+    const openaiApiKeySecretArn = this.node.tryGetContext('openai_api_key_secret_arn') || '';
     const athenaDatabase = this.node.tryGetContext('athena_database') || '';
     const athenaOutput = this.node.tryGetContext('athena_output') || '';
 
@@ -464,7 +471,6 @@ def send_response(url, event, status, reason=''):
     };
 
     if (openaiBaseUrl) envVars['OPENAI_BASE_URL'] = openaiBaseUrl;
-    if (openaiApiKey) envVars['OPENAI_API_KEY'] = openaiApiKey;
     if (openaiModel) envVars['OPENAI_MODEL'] = openaiModel;
 
     // ── RDS datasource env vars ──
@@ -473,19 +479,71 @@ def send_response(url, event, status, reason=''):
       envVars['MYSQL_PORT'] = rdsPort || '3306';
       envVars['MYSQL_DATABASE'] = rdsDatabase;
       envVars['MYSQL_USER'] = rdsUser;
-      envVars['MYSQL_PASSWORD'] = rdsPassword;
     }
     if (rdsEngine === 'postgresql') {
       envVars['POSTGRES_HOST'] = rdsHost;
       envVars['POSTGRES_PORT'] = rdsPort || '5432';
       envVars['POSTGRES_DATABASE'] = rdsDatabase;
       envVars['POSTGRES_USER'] = rdsUser;
-      envVars['POSTGRES_PASSWORD'] = rdsPassword;
     }
     // ── Athena ──
     if (athenaDatabase) {
       envVars['ATHENA_DATABASE'] = athenaDatabase;
       envVars['ATHENA_OUTPUT'] = athenaOutput;
+    }
+
+    // The data-source password the application actually reads. It is only here
+    // if a datasource was configured at deploy time.
+    //
+    // OPENAI_API_KEY is deliberately absent: no Python in this repository reads
+    // it from the environment -- the application takes the key from the model
+    // record in DynamoDB -- so putting it on the task definition disclosed a
+    // credential that nothing consumed.
+    const containerSecrets: Record<string, ecs.Secret> = {
+      AGENTIC_AUTO_JWT_SECRET: ecs.Secret.fromSecretsManager(jwtSecretStore),
+    };
+
+    const rdsPasswordSecret = rdsPasswordSecretArn
+      ? secretsmanager.Secret.fromSecretCompleteArn(this, 'RdsPasswordSecret', rdsPasswordSecretArn)
+      : undefined;
+
+    if (rdsEngine && (rdsPasswordSecret || rdsPassword)) {
+      if (!rdsPasswordSecret) {
+        cdk.Annotations.of(this).addWarning(
+          'rds_password was supplied as a context value, so it is a literal in the ' +
+          'synthesised template. Pass -c rds_password_secret_arn=<arn> instead to keep ' +
+          'it out of the template and the task definition.'
+        );
+      }
+      const source = rdsPasswordSecret
+        ? ecs.Secret.fromSecretsManager(rdsPasswordSecret)
+        : ecs.Secret.fromSecretsManager(
+            new secretsmanager.Secret(this, 'RdsPasswordStore', {
+              description: 'Data-source password supplied at deploy time',
+              secretStringValue: cdk.SecretValue.unsafePlainText(rdsPassword),
+            })
+          );
+      containerSecrets[rdsEngine === 'mysql' ? 'MYSQL_PASSWORD' : 'POSTGRES_PASSWORD'] = source;
+    }
+
+    // The init Lambda has to write both of these into the config table, so the
+    // values must reach it -- but by ARN, read at run time, rather than as
+    // environment variables on the function, which lambda:GetFunctionConfiguration
+    // returns in plaintext.
+    const openaiKeySecret = openaiApiKeySecretArn
+      ? secretsmanager.Secret.fromSecretCompleteArn(this, 'OpenAiKeySecret', openaiApiKeySecretArn)
+      : openaiApiKey
+      ? new secretsmanager.Secret(this, 'OpenAiKeyStore', {
+          description: 'OpenAI-compatible API key supplied at deploy time',
+          secretStringValue: cdk.SecretValue.unsafePlainText(openaiApiKey),
+        })
+      : undefined;
+
+    if (openaiApiKey && !openaiApiKeySecretArn) {
+      cdk.Annotations.of(this).addWarning(
+        'openai_api_key was supplied as a context value, so it is a literal in the ' +
+        'synthesised template. Pass -c openai_api_key_secret_arn=<arn> instead.'
+      );
     }
 
     const container = taskDef.addContainer('App', {
@@ -499,9 +557,7 @@ def send_response(url, event, status, reason=''):
       environment: envVars,
       // Injected from Secrets Manager at container start. Never in `environment`:
       // see the note on the parameters above.
-      secrets: {
-        AGENTIC_AUTO_JWT_SECRET: ecs.Secret.fromSecretsManager(jwtSecretStore),
-      },
+      secrets: containerSecrets,
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
         streamPrefix: 'app',
@@ -630,20 +686,26 @@ def send_response(url, event, status, reason=''):
         DEFAULT_MODEL: modelId,
         AUTH_PROVIDER: authProvider,
         OPENAI_BASE_URL: openaiBaseUrl,
-        OPENAI_API_KEY: openaiApiKey,
+        OPENAI_API_KEY_SECRET_ARN: openaiKeySecret?.secretArn ?? '',
         OPENAI_MODEL: openaiModel,
         RDS_ENGINE: rdsEngine,
         RDS_HOST: rdsHost,
         RDS_PORT: rdsPort,
         RDS_DATABASE: rdsDatabase,
         RDS_USER: rdsUser,
-        RDS_PASSWORD: rdsPassword,
+        RDS_PASSWORD_SECRET_ARN: rdsPasswordSecret?.secretArn
+          ?? (containerSecrets['POSTGRES_PASSWORD'] || containerSecrets['MYSQL_PASSWORD']
+              ? (this.node.tryFindChild('RdsPasswordStore') as secretsmanager.Secret)?.secretArn ?? ''
+              : ''),
         ATHENA_DATABASE: athenaDatabase,
         ATHENA_OUTPUT: athenaOutput,
       },
     });
     configTable.grantReadWriteData(initFn);
     adminPasswordStore.grantRead(initFn);
+    openaiKeySecret?.grantRead(initFn);
+    rdsPasswordSecret?.grantRead(initFn);
+    (this.node.tryFindChild('RdsPasswordStore') as secretsmanager.Secret | undefined)?.grantRead(initFn);
 
     const initProvider = new cr.Provider(this, 'InitProvider', {
       onEventHandler: initFn,
@@ -795,7 +857,16 @@ def send_response(url, event, status, reason=''):
         '0.0.0.0/0, so CloudFormation refuses the open value before the group exists.',
     });
 
-    for (const secret of [jwtSecretStore, adminPasswordStore]) {
+    // Only the secrets this stack creates. A secret imported by ARN is not a
+    // CfnSecret here, so the rule does not see it -- rotating it belongs to
+    // whoever owns it.
+    const createdSecrets: secretsmanager.Secret[] = [jwtSecretStore, adminPasswordStore];
+    for (const id of ['OpenAiKeyStore', 'RdsPasswordStore']) {
+      const created = this.node.tryFindChild(id) as secretsmanager.Secret | undefined;
+      if (created) createdSecrets.push(created);
+    }
+
+    for (const secret of createdSecrets) {
       Validations.of(secret).acknowledge({
         id: 'AwsSolutions-SMG4',
         reason:
@@ -865,6 +936,18 @@ def handler(event, context):
     # moment it was turned on. The format, the salt and the key all have to match
     # what local_auth expects, so they are derived the same way here.
     sm = boto3.client('secretsmanager')
+
+    def _secret(env_name):
+        """Read a secret by ARN from the environment, or '' if none is configured.
+
+        The ARN is safe to carry in the function's configuration; the value is
+        not, which is why these arrive this way rather than as plain variables.
+        """
+        arn = os.environ.get(env_name, '')
+        if not arn:
+            return ''
+        return sm.get_secret_value(SecretId=arn)['SecretString']
+
     pw = sm.get_secret_value(SecretId=os.environ['ADMIN_PASSWORD_SECRET_ARN'])['SecretString']
 
     PBKDF2_ITERATIONS = 600000  # keep in step with local_auth._PBKDF2_ITERATIONS
@@ -898,7 +981,7 @@ def handler(event, context):
     else:
         # OpenAI-compatible: for China region use third-party LLM providers
         base_url = os.environ.get('OPENAI_BASE_URL', '')
-        api_key = os.environ.get('OPENAI_API_KEY', '')
+        api_key = _secret('OPENAI_API_KEY_SECRET_ARN')
         model_name = os.environ.get('OPENAI_MODEL', '')
         # Only add model entry if at least base_url is provided
         if base_url:
@@ -925,7 +1008,7 @@ def handler(event, context):
     rds_port = os.environ.get('RDS_PORT', '')
     rds_database = os.environ.get('RDS_DATABASE', '')
     rds_user = os.environ.get('RDS_USER', '')
-    rds_password = os.environ.get('RDS_PASSWORD', '')
+    rds_password = _secret('RDS_PASSWORD_SECRET_ARN')
     athena_db = os.environ.get('ATHENA_DATABASE', '')
     athena_output = os.environ.get('ATHENA_OUTPUT', '')
     

@@ -63,7 +63,7 @@ fi
 echo "✅ Docker 已就绪"
 
 # ── Optional: Model config ──
-CDK_CONTEXT=""
+_CDK_CONTEXT=""
 echo ""
 echo "🤖 模型配置 (可跳过, 部署后在管理后台配置)"
 if [ "$IS_CHINA" = true ]; then
@@ -75,13 +75,13 @@ if [ "$IS_CHINA" = true ]; then
         echo ""
         read -p "   Model ID (如 Pro/zai-org/GLM-5): " OPENAI_MODEL
         if [ -n "$OPENAI_URL" ]; then
-            CDK_CONTEXT="$CDK_CONTEXT -c openai_base_url=$OPENAI_URL"
+            _CDK_CONTEXT="$_CDK_CONTEXT -c openai_base_url=$OPENAI_URL"
         fi
         if [ -n "$OPENAI_KEY" ]; then
-            CDK_CONTEXT="$CDK_CONTEXT -c openai_api_key=$OPENAI_KEY"
+            _CDK_CONTEXT="$_CDK_CONTEXT -c openai_api_key=$OPENAI_KEY"
         fi
         if [ -n "$OPENAI_MODEL" ]; then
-            CDK_CONTEXT="$CDK_CONTEXT -c openai_model=$OPENAI_MODEL"
+            _CDK_CONTEXT="$_CDK_CONTEXT -c openai_model=$OPENAI_MODEL"
         fi
     else
         echo "   ⏭️  跳过, 部署后在 管理后台 → 模型管理 中配置"
@@ -92,8 +92,8 @@ else
 fi
 
 # ═══════ 数据源配置 (可选) ═══════
-RDS_CTX=""
-ATHENA_CTX=""
+_RDS_CTX=""
+_ATHENA_CTX=""
 RDS_ENGINE=""
 RDS_HOST=""
 RDS_PORT=""
@@ -136,7 +136,7 @@ if [[ "$DS_CHOICE" == "1" || "$DS_CHOICE" == "2" ]]; then
         echo "   ⚠️  RDS 配置不完整, 跳过"
         RDS_ENGINE=""
     else
-        RDS_CTX="-c rds_engine=$RDS_ENGINE -c rds_host=$RDS_HOST -c rds_port=$RDS_PORT -c rds_database=$RDS_DATABASE -c rds_user=$RDS_USER -c rds_password=$RDS_PASSWORD"
+        _RDS_CTX="-c rds_engine=$RDS_ENGINE -c rds_host=$RDS_HOST -c rds_port=$RDS_PORT -c rds_database=$RDS_DATABASE -c rds_user=$RDS_USER -c rds_password=$RDS_PASSWORD"
         echo "   ✅ ${RDS_ENGINE^^} 数据源已配置"
     fi
 fi
@@ -147,18 +147,18 @@ if [[ "$CONFIGURE_ATHENA" =~ ^[yY] ]]; then
     read -p "   Athena Database name: " ATHENA_DB
     read -p "   Query output S3 path (如 s3://my-bucket/athena-results/): " ATHENA_OUTPUT
     if [ -n "$ATHENA_DB" ]; then
-        ATHENA_CTX="-c athena_database=$ATHENA_DB"
+        _ATHENA_CTX="-c athena_database=$ATHENA_DB"
         if [ -n "$ATHENA_OUTPUT" ]; then
-            ATHENA_CTX="$ATHENA_CTX -c athena_output=$ATHENA_OUTPUT"
+            _ATHENA_CTX="$_ATHENA_CTX -c athena_output=$ATHENA_OUTPUT"
         fi
         echo "   ✅ Athena 数据源已配置"
     fi
 fi
 
 # ── Build command ──
-VPC_CTX=""
+_VPC_CTX=""
 if [ -n "$VPC_ID" ]; then
-    VPC_CTX="-c vpc_id=$VPC_ID"
+    _VPC_CTX="-c vpc_id=$VPC_ID"
 fi
 
 echo ""
@@ -202,7 +202,7 @@ echo "🚀 开始部署..."
 npx cdk deploy \
     --parameters AdminPassword="$ADMIN_PW" \
     --parameters AllowedCIDRs="$ALLOWED_CIDRS" \
-    $VPC_CTX $RDS_CTX $ATHENA_CTX $CDK_CONTEXT \
+    $_VPC_CTX $_RDS_CTX $_ATHENA_CTX $_CDK_CONTEXT \
     --require-approval broadening
 
 echo ""

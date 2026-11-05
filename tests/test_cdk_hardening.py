@@ -40,20 +40,36 @@ def check(name, condition, detail=""):
         print(f"  FAIL  {name}{('  — ' + str(detail)) if detail else ''}")
 
 
-def synth():
+def _run_synth(context=None):
+    """Run `cdk synth --json`. The only place in this file that starts a process.
+
+    Running synth *is* the cdk_nag scan, since the pack is registered as a
+    validation plugin, so a non-zero exit is itself a finding.
+
+    Every element of the argument list is a literal: the executable is resolved
+    from PATH once at import, the subcommand is fixed, and the context keys and
+    values come from the two call sites below, which are also literals. shell is
+    False, so the list goes to execve as-is and nothing parses it as a command
+    line. There is one call site rather than two so that this reasoning lives in
+    one place.
+    """
     if not os.path.isdir(os.path.join(CDK, "node_modules")):
         print("SKIP: cdk/node_modules is absent. Run `npm install` in cdk/ first.")
         sys.exit(0)
     if not NPX:
         print("SKIP: npx is not on PATH.")
         sys.exit(0)
-    # Runs the cdk_nag plugin too, so a non-zero exit is itself a finding.
-    # Every element is a literal defined in this file; nothing here comes from
-    # outside the process, and shell=False means no shell parses any of it.
-    proc = subprocess.run(  # nosec B603 B607
-        [NPX, "cdk", "synth", "--json"],
-        cwd=CDK, capture_output=True, text=True, timeout=900, shell=False,
+    args = [NPX, "cdk", "synth", "--json"]
+    for key, value in (context or {}).items():
+        args += ["-c", f"{key}={value}"]
+    # nosemgrep: dangerous-subprocess-use-audit
+    return subprocess.run(  # nosec B603 B607
+        args, cwd=CDK, capture_output=True, text=True, timeout=900, shell=False,
     )
+
+
+def synth():
+    proc = _run_synth()
     if proc.returncode != 0:
         print("FAIL  cdk synth exited non-zero. cdk_nag findings, or a synth error:")
         print("\n".join(proc.stderr.splitlines()[-25:]))
@@ -235,16 +251,7 @@ check("the deployment circuit breaker is enabled",
 
 # ── the TLS and public-exposure invariants, by synthesising again ───
 def synth_with(ctx, expect_failure=False):
-    # The context keys and values are literals from the two call sites below, so
-    # the argument list is fully determined by this file. shell=False, so the
-    # list is passed to execve as-is and nothing parses it as a command line.
-    args = [NPX, "cdk", "synth", "--json"]
-    for k, v in ctx.items():
-        args += ["-c", f"{k}={v}"]
-    # nosemgrep: dangerous-subprocess-use-audit
-    proc = subprocess.run(  # nosec B603
-        args, cwd=CDK, capture_output=True, text=True, timeout=900, shell=False,
-    )
+    proc = _run_synth(ctx)
     if expect_failure:
         return proc.returncode != 0, proc.stderr
     if proc.returncode != 0:
@@ -290,6 +297,78 @@ else:
               any(a.get("Type") == "redirect" for a in l["Properties"].get("DefaultActions", []))
               for l in plain
           ))
+
+# ── no deploy-time credential may reach a resource property ─────────
+# Done with canaries rather than by reading the TypeScript: synthesise with
+# distinctive values and then search the whole template for them. A parameter or
+# context value referenced from a task definition's `environment` or a Lambda's
+# `environment` is resolved into that resource in plaintext, where
+# ecs:DescribeTaskDefinition and lambda:GetFunctionConfiguration return it, and
+# task definition revisions are retained so it outlives a rotation.
+
+CANARY_OPENAI = "CANARY-OPENAI-KEY-DO-NOT-SHIP"
+CANARY_RDS = "CANARY-RDS-PASSWORD-DO-NOT-SHIP"
+
+canary_template, _ = synth_with({
+    "openai_api_key": CANARY_OPENAI,
+    "rds_engine": "postgresql",
+    "rds_host": "db.example.invalid",
+    "rds_user": "svc",
+    "rds_password": CANARY_RDS,
+})
+
+if canary_template is None:
+    check("a deploy-time credential never reaches a task definition or Lambda", False,
+          "canary synth failed")
+else:
+    canary_res = canary_template["Resources"]
+
+    def _carriers(canary):
+        return {
+            res.get("Type"): lid
+            for lid, res in canary_res.items()
+            if canary in json.dumps(res)
+        }
+
+    for canary, label in ((CANARY_OPENAI, "model API key"), (CANARY_RDS, "data-source password")):
+        carriers = _carriers(canary)
+        # A context value is a literal at synth time, so a Secrets Manager
+        # resource is the one place it legitimately lands; the stack warns and
+        # offers a *_secret_arn context value to avoid even that.
+        unexpected = {t: l for t, l in carriers.items() if t != "AWS::SecretsManager::Secret"}
+        check(f"the {label} reaches nothing but a Secrets Manager resource",
+              not unexpected, unexpected)
+
+    canary_td = [r for r in canary_res.values() if r["Type"] == "AWS::ECS::TaskDefinition"][0]
+    canary_container = canary_td["Properties"]["ContainerDefinitions"][0]
+    env_names = [e["Name"] for e in canary_container.get("Environment", [])]
+    secret_names = [x["Name"] for x in canary_container.get("Secrets", [])]
+
+    check("no environment variable on the task is named like a credential",
+          not [n for n in env_names if "PASSWORD" in n or "API_KEY" in n or "SECRET" in n],
+          [n for n in env_names if "PASSWORD" in n or "API_KEY" in n or "SECRET" in n])
+    check("a configured data-source password arrives through the secrets block",
+          "POSTGRES_PASSWORD" in secret_names, secret_names)
+
+    canary_lambdas = {
+        lid: r for lid, r in canary_res.items() if r["Type"] == "AWS::Lambda::Function"
+    }
+    offenders = []
+    for lid, fn in canary_lambdas.items():
+        for name, value in (fn["Properties"].get("Environment", {}).get("Variables", {}) or {}).items():
+            if not any(t in name for t in ("PASSWORD", "API_KEY", "SECRET")):
+                continue
+            # Only an ARN reference is acceptable here.
+            if not name.endswith("_SECRET_ARN"):
+                offenders.append(f"{lid}.{name}")
+    check("a Lambda receives credentials only as a secret ARN", not offenders, offenders)
+
+    # OPENAI_API_KEY was on the task definition and nothing read it from the
+    # environment: the application takes the key from the model record in
+    # DynamoDB. It disclosed a credential no consumer wanted.
+    check("the unread OPENAI_API_KEY environment variable is gone",
+          "OPENAI_API_KEY" not in env_names, env_names)
+
 
 print()
 if FAILED:
