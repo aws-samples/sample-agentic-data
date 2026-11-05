@@ -4,6 +4,26 @@
 
 **中文** | [English](README_EN.md)
 
+> ## ⚠️ 安全公告 / Security Notice
+>
+> **早于 `v1.0.1` 的版本含有一个 Critical 级别的认证缺陷，请勿部署。**
+>
+> 认证默认为关闭（`AGENTIC_AUTO_AUTH_ENABLED` 默认 `false`），而随仓库提供的 CDK
+> 栈从未设置该变量。在该状态下，中间件为**每一个请求**注入 `role: "admin"` 身份，
+> 且不做任何校验；负载均衡器默认暴露于公网的 HTTP 80 端口。任何能访问到它的人都是
+> 管理员，无需任何凭证。
+>
+> 此问题由外部研究者通过 AWS Vulnerability Reporting Program 报告，CVSS 3.1 评分 **9.8
+> (Critical)**，CWE-306 / CWE-1188。
+>
+> **如果你已经部署了旧版本：**
+> 1. 立即限制负载均衡器的入站访问，或将其改为内网（internal）。
+> 2. 升级到 `v1.0.1` 或更新，并在部署时显式传入 `AllowedCIDRs` 和 `JwtSigningSecret`。
+> 3. 审查负载均衡器和应用日志，排查未经授权的访问。
+>
+> 已修复的内容见 [SECURITY.md](SECURITY.md)。问题报告请发至 aws-security@amazon.com。
+
+
 多智能体对话式 BI 平台 — 语义层 + VQR + NL2SQL 三层确定性架构，通过自然语言对话连接多种数据源进行智能分析。
 
 ## 平台简介

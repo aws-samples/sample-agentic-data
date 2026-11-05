@@ -33,10 +33,27 @@ export class AgenticDataStack extends cdk.Stack {
       description: 'Admin user password for local auth (min 8 chars, no default)',
     });
 
+    // No default. 10.0.0.0/8 is the whole RFC1918 private range and is not scoped
+    // to the deployer, so a default here silently widened every deployment's
+    // exposure. A value must now be supplied explicitly.
     const allowedCidrs = new cdk.CfnParameter(this, 'AllowedCIDRs', {
       type: 'String',
-      default: '10.0.0.0/8',
-      description: 'Comma-separated CIDRs for ALB access (NEVER use 0.0.0.0/0)',
+      minLength: 9,
+      allowedPattern: '^(?!0\\.0\\.0\\.0/0)([0-9.]+/[0-9]+)(,([0-9.]+/[0-9]+))*$',
+      description:
+        'REQUIRED. Comma-separated CIDRs permitted to reach the load balancer. ' +
+        'Scope this to your own address range. 0.0.0.0/0 is rejected.',
+    });
+
+    // Signing key for the local-auth JWT path. There is deliberately no default:
+    // a default committed to this repository would be a published signing key.
+    const jwtSecret = new cdk.CfnParameter(this, 'JwtSigningSecret', {
+      type: 'String',
+      noEcho: true,
+      minLength: 32,
+      description:
+        'REQUIRED. Signing secret for local-auth tokens, min 32 chars. ' +
+        'Generate with: openssl rand -base64 48',
     });
 
     // Model config is OPTIONAL at deploy time — can be configured later via Admin UI
@@ -351,6 +368,11 @@ def send_response(url, event, status, reason=''):
       AGENTIC_AUTO_DATA_BUCKET: dataBucket.bucketName,
       AGENTIC_AUTO_REPORTS_BUCKET: dataBucket.bucketName,
       AGENTIC_DATA_ENV: 'production',
+      // Set explicitly. The application fails secure without it, but relying on a
+      // library default is what produced the original defect: the stack set
+      // AUTH_PROVIDER and nothing set AUTH_ENABLED, so every deployment ran open.
+      AGENTIC_AUTO_AUTH_ENABLED: 'true',
+      AGENTIC_AUTO_JWT_SECRET: jwtSecret.valueAsString,
       AUTH_PROVIDER: authProvider,
       MODEL_PROVIDER: modelProvider,
       DEFAULT_MODEL: modelId,
@@ -406,16 +428,53 @@ def send_response(url, event, status, reason=''):
     container.addPortMappings({ containerPort: 8501 });
 
     // ALB + Fargate Service
+    // Internal by default. The original stack was unconditionally internet-facing
+    // on plaintext HTTP, which is what turned an application-level authorisation
+    // defect into an internet-reachable one. Going public is now an explicit
+    // opt-in and requires a certificate.
+    const publiclyAccessible =
+      String(this.node.tryGetContext('publicly_accessible') ?? 'false') === 'true';
+    const certificateArn = this.node.tryGetContext('certificate_arn') || '';
+
+    if (publiclyAccessible && !certificateArn) {
+      throw new Error(
+        'publicly_accessible=true requires certificate_arn. An internet-facing ' +
+        'listener must terminate TLS. Pass -c certificate_arn=<acm-arn>, or leave ' +
+        'publicly_accessible unset to deploy an internal load balancer.'
+      );
+    }
+
     const alb = new elbv2.ApplicationLoadBalancer(this, 'ALB', {
       vpc,
-      internetFacing: true,
+      internetFacing: publiclyAccessible,
       securityGroup: albSg,
     });
 
-    const listener = alb.addListener('Listener', {
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-    });
+    const listener = certificateArn
+      ? alb.addListener('Listener', {
+          port: 443,
+          protocol: elbv2.ApplicationProtocol.HTTPS,
+          certificates: [elbv2.ListenerCertificate.fromArn(certificateArn)],
+          sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS,
+        })
+      : alb.addListener('Listener', {
+          // Internal only, reached from inside the VPC via the CIDR allowlist.
+          port: 80,
+          protocol: elbv2.ApplicationProtocol.HTTP,
+        });
+
+    if (certificateArn) {
+      // Redirect plaintext rather than serving it.
+      alb.addListener('HttpRedirect', {
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        defaultAction: elbv2.ListenerAction.redirect({
+          protocol: 'HTTPS',
+          port: '443',
+          permanent: true,
+        }),
+      });
+    }
 
     const service = new ecs.FargateService(this, 'Service', {
       cluster,

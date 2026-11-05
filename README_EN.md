@@ -4,6 +4,31 @@
 
 [中文](README.md) | **English**
 
+> ## ⚠️ Security Notice
+>
+> **Do not deploy any version earlier than `v1.0.1`. It contains a Critical
+> authentication defect.**
+>
+> Authentication defaulted to off (`AGENTIC_AUTO_AUTH_ENABLED` defaulted to `false`)
+> and the CDK stack shipped in this repository never set that variable. In that state
+> the middleware injected a `role: "admin"` identity into **every request** with no
+> check of any kind, behind a load balancer that defaulted to internet-facing plain
+> HTTP. Any caller who could reach it was a full administrator with no credential.
+>
+> Reported by an external researcher through the AWS Vulnerability Reporting Program.
+> CVSS 3.1 score **9.8 (Critical)**, CWE-306 / CWE-1188.
+>
+> **If you have already deployed an earlier version:**
+> 1. Restrict ingress to the load balancer immediately, or make it internal.
+> 2. Upgrade to `v1.0.1` or later and supply `AllowedCIDRs` and `JwtSigningSecret`
+>    explicitly at deploy time.
+> 3. Review load balancer and application logs for unauthorised access.
+>
+> See [SECURITY.md](SECURITY.md) for what changed. Report issues to
+> aws-security@amazon.com.
+
+
+
 Multi-agent ChatBI platform — three-tier deterministic architecture (Semantic Layer + VQR + NL2SQL) for intelligent data analysis through natural language conversations across multiple data sources.
 
 ## Overview

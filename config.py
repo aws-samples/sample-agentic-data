@@ -45,7 +45,11 @@ SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.silic
 COGNITO_USER_POOL_ID = os.environ.get("AGENTIC_AUTO_COGNITO_POOL_ID", "")
 COGNITO_CLIENT_ID = os.environ.get("AGENTIC_AUTO_COGNITO_CLIENT_ID", "")
 COGNITO_REGION = os.environ.get("AGENTIC_AUTO_COGNITO_REGION", REGION)
-AUTH_ENABLED = os.environ.get("AGENTIC_AUTO_AUTH_ENABLED", "false").lower() == "true"
+# Authentication is ON unless explicitly disabled. Only the exact string "false"
+# turns it off, so a typo or an unset variable fails secure rather than open.
+# Disabling it is a local-development affordance only; it is refused when
+# AGENTIC_DATA_ENV is "production" (see auth.py).
+AUTH_ENABLED = os.environ.get("AGENTIC_AUTO_AUTH_ENABLED", "true").strip().lower() != "false"
 
 # Rate Limiting
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("AGENTIC_AUTO_RATE_LIMIT", "15"))

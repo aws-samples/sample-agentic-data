@@ -1,27 +1,93 @@
 """
-Authentication middleware — Cognito JWT validation.
-When AUTH_ENABLED=false, all requests pass through with a default user.
-When AUTH_ENABLED=true, validates JWT from Authorization header.
+Authentication middleware.
+
+Authentication is enabled by default. When AGENTIC_AUTO_AUTH_ENABLED is set to
+the exact string "false", requests are let through with an *unprivileged*
+identity for local development only; that mode is refused outright when
+AGENTIC_DATA_ENV is "production".
+
+Cognito tokens are verified against the user pool's JWKS (RS256), including
+signature, issuer, audience and expiry. Claims are never read from an
+unverified token.
 """
-import time, json, hmac, hashlib, base64, urllib.request
+import time, json, logging, os
 from functools import lru_cache
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-import os
-from config import AUTH_ENABLED, COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION
+from config import (
+    AUTH_ENABLED, ENVIRONMENT,
+    COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION,
+)
+
+logger = logging.getLogger(__name__)
 
 AUTH_PROVIDER = os.environ.get("AGENTIC_AUTO_AUTH_PROVIDER", "cognito")  # cognito | local | authing
 
-# Simple JWT decode (no cryptographic verification in demo — Cognito handles that)
-def _decode_jwt_payload(token: str) -> dict:
-    """Decode JWT payload without verification (demo mode)."""
+# A deployment must not be able to reach production with authentication off.
+if not AUTH_ENABLED:
+    if str(ENVIRONMENT).strip().lower() == "production":
+        raise RuntimeError(
+            "AGENTIC_AUTO_AUTH_ENABLED=false is refused when AGENTIC_DATA_ENV=production. "
+            "Authentication cannot be disabled in a production deployment."
+        )
+    logger.warning(
+        "=" * 78 + "\n"
+        "AUTHENTICATION IS DISABLED (AGENTIC_AUTO_AUTH_ENABLED=false).\n"
+        "Every request runs as an unauthenticated, read-only identity.\n"
+        "This is for local development only. Never expose this process to a network.\n"
+        + "=" * 78
+    )
+
+
+@lru_cache(maxsize=1)
+def _jwks_client():
+    """PyJWKClient for the configured Cognito user pool. Cached; it caches keys itself."""
+    import jwt  # PyJWT
+    if not (COGNITO_USER_POOL_ID and COGNITO_REGION):
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is enabled but Cognito is not configured.",
+        )
+    url = (
+        f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com"
+        f"/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+    )
+    return jwt.PyJWKClient(url)
+
+
+def _verify_cognito_token(token: str) -> dict:
+    """Verify a Cognito JWT and return its claims.
+
+    Signature, expiry and issuer are all enforced. Raises 401 on any failure, so
+    a malformed or forged token can never reach the claim-reading path below.
+    """
+    import jwt
+    from jwt import InvalidTokenError
+    issuer = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
     try:
-        payload = token.split(".")[1]
-        # Add padding
-        payload += "=" * (4 - len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return {}
+        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            # Cognito access tokens carry client_id rather than aud, so audience is
+            # checked explicitly below instead of by the decoder.
+            options={"verify_aud": False, "require": ["exp", "iss", "sub"]},
+        )
+    except HTTPException:
+        raise
+    except InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+    except Exception as exc:  # network / JWKS failure
+        logger.warning("JWKS verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Token could not be verified") from exc
+
+    if COGNITO_CLIENT_ID:
+        presented = claims.get("aud") or claims.get("client_id")
+        if presented != COGNITO_CLIENT_ID:
+            raise HTTPException(status_code=401, detail="Token was not issued for this client")
+    return claims
 
 # Rate limiting state
 _rate_limits: dict = {}  # user_id -> [(timestamp, ...)]
@@ -53,12 +119,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         if not AUTH_ENABLED:
-            # No auth — default user
+            # Local development only. Deliberately NOT an administrator: the
+            # previous "admin" default meant any caller of any deployment held
+            # full administrative rights with no credential.
             request.state.user = {
-                "user_id": "default",
-                "username": "demo_user",
-                "email": "demo@example.com",
-                "role": "admin",
+                "user_id": "anonymous",
+                "username": "anonymous",
+                "email": "",
+                "role": "viewer",
+                "unauthenticated": True,
             }
             return await call_next(request)
 
@@ -116,10 +185,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     return await call_next(request)
             except Exception:
                 pass
-            # Cognito JWT decode
-            payload = _decode_jwt_payload(token)
-            if not payload or payload.get("exp", 0) < time.time():
-                raise HTTPException(status_code=401, detail="Token 已过期")
+            # Cognito JWT — signature verified against the pool's JWKS.
+            payload = _verify_cognito_token(token)
             request.state.user = {
                 "user_id": payload.get("sub", "unknown"),
                 "username": payload.get("cognito:username", payload.get("username", "unknown")),
@@ -130,10 +197,24 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 def get_current_user(request: Request) -> dict:
-    """Get current user from request state."""
+    """Current user from request state.
+
+    The fallback is deliberately unprivileged. It previously returned
+    role "admin", so any path that reached a route without passing through the
+    middleware was treated as an administrator.
+    """
     return getattr(request.state, "user", {
-        "user_id": "default",
-        "username": "demo_user",
+        "user_id": "anonymous",
+        "username": "anonymous",
         "email": "",
-        "role": "admin",
+        "role": "viewer",
+        "unauthenticated": True,
     })
+
+
+def require_admin(request: Request) -> dict:
+    """Return the current user, or raise 403 unless they are an administrator."""
+    user = get_current_user(request)
+    if user.get("unauthenticated") or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Administrator privileges required")
+    return user

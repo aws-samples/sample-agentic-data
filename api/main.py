@@ -3929,11 +3929,10 @@ class ResetPasswordRequest(BaseModel):
 @app.post("/api/auth/login")
 def api_login(req: LoginRequest):
     if not AUTH_ENABLED:
-        # Demo mode — return fake token
-        import base64, json as _json, time as _time
-        payload = {"sub": "demo", "email": req.email, "custom:role": "admin", "exp": int(_time.time()) + 86400}
-        fake_token = "demo." + base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=") + ".sig"
-        return {"ok": True, "access_token": fake_token, "id_token": fake_token, "refresh_token": "", "expires_in": 86400, "user": {"email": req.email, "role": "admin"}}
+        # Previously minted an unsigned token asserting custom:role=admin and
+        # handed it to the caller. Because the Cognito path did not verify
+        # signatures, that token was then accepted even with auth enabled.
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     _provider = os.environ.get("AGENTIC_AUTO_AUTH_PROVIDER", "cognito")
     if _provider in ("local", "authing"):
         from agentic_core.local_auth import local_login
@@ -4056,7 +4055,7 @@ def api_refresh(request: Request):
     if not refresh_tok:
         raise HTTPException(status_code=400, detail="Missing refresh token")
     if not AUTH_ENABLED:
-        return {"ok": True, "access_token": "demo-refreshed", "id_token": "demo-refreshed"}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     provider = os.environ.get("AGENTIC_AUTO_AUTH_PROVIDER", "cognito")
     if provider == "authing":
         from agentic_core.authing_auth import refresh_tokens
@@ -4067,7 +4066,7 @@ def api_refresh(request: Request):
 @app.post("/api/auth/change-password")
 def api_change_password(req: ChangePasswordRequest, request: Request):
     if not AUTH_ENABLED:
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     token = request.headers.get("authorization", "").replace("Bearer ", "")
     from agentic_core.cognito_auth import change_password
     return change_password(token, req.old_password, req.new_password)
@@ -4080,11 +4079,7 @@ def api_list_users(request: Request):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可访问")
     if not AUTH_ENABLED:
-        return {"users": [
-            {"username": "admin@agentic-data.com", "email": "admin@agentic-data.com", "role": "admin", "status": "CONFIRMED", "enabled": True},
-            {"username": "analyst@agentic-data.com", "email": "analyst@agentic-data.com", "role": "analyst", "status": "CONFIRMED", "enabled": True},
-            {"username": "viewer@agentic-data.com", "email": "viewer@agentic-data.com", "role": "viewer", "status": "CONFIRMED", "enabled": True},
-        ]}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     from agentic_core.cognito_auth import list_users
     return {"users": list_users()}
 
@@ -4094,7 +4089,7 @@ def api_create_user(req: SignupRequest, request: Request):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可创建用户")
     if not AUTH_ENABLED:
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     from agentic_core.cognito_auth import create_user
     return create_user(req.email, req.password, req.role)
 
@@ -4104,7 +4099,7 @@ def api_update_user_role(email: str, req: UpdateRoleRequest, request: Request):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可修改角色")
     if not AUTH_ENABLED:
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     from agentic_core.cognito_auth import update_user_role
     return update_user_role(email, req.role)
 
@@ -4114,7 +4109,7 @@ def api_toggle_user(email: str, request: Request):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可操作")
     if not AUTH_ENABLED:
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     from agentic_core.cognito_auth import list_users, disable_user, enable_user
     users = list_users()
     target = next((u for u in users if u["email"] == email), None)
@@ -4133,7 +4128,7 @@ def api_delete_user(email: str, request: Request):
     if email == user.get("email"):
         raise HTTPException(status_code=400, detail="不能删除自己")
     if not AUTH_ENABLED:
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     from agentic_core.cognito_auth import delete_user
     return delete_user(email)
 
@@ -4143,7 +4138,7 @@ def api_reset_password(email: str, req: ResetPasswordRequest, request: Request):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可重置密码")
     if not AUTH_ENABLED:
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Authentication is not configured on this deployment")
     from agentic_core.cognito_auth import reset_user_password
     return reset_user_password(email, req.new_password)
 

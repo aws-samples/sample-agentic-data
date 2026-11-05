@@ -12,7 +12,18 @@ import boto3
 
 from config import CONFIG_TABLE, REGION
 
-_JWT_SECRET = os.environ.get("AGENTIC_AUTO_JWT_SECRET", "agentic-data-default-secret-change-me")
+# No default. A shipped default secret is a published signing key: anyone reading
+# this repository could mint a valid token. Absent configuration we refuse to start
+# rather than accept forgeable tokens.
+_JWT_SECRET = os.environ.get("AGENTIC_AUTO_JWT_SECRET", "")
+if not _JWT_SECRET:
+    raise RuntimeError(
+        "AGENTIC_AUTO_JWT_SECRET is not set. Generate one with "
+        "`openssl rand -base64 48` and supply it via the deployment's secret store. "
+        "Local auth cannot run without it."
+    )
+if len(_JWT_SECRET) < 32:
+    raise RuntimeError("AGENTIC_AUTO_JWT_SECRET must be at least 32 characters.")
 _ADMIN_PASSWORD = os.environ.get("AGENTIC_AUTO_ADMIN_PASSWORD", "")  # Must be set via env var at deploy time
 
 # ── Simple JWT (no PyJWT dependency) ──
