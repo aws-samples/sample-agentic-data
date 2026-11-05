@@ -188,9 +188,24 @@ place on the next successful login.
 | `api/main.py` | **The application could not start.** The first remediation deleted `_decode_jwt_payload` from `auth.py` and left `from auth import ... _decode_jwt_payload` in place, so importing the app raised `ImportError`. Both call sites now use the verified decoder. |
 | `agentic_core/local_auth.py` | `_ensure_admin()` called `logger.warning()` in a module that never imported `logging`, so a deployment without `AGENTIC_AUTO_ADMIN_PASSWORD` raised `NameError` on the first login instead of warning. |
 | `agentic_core/vqr.py` | `_verify_sql_execution()` executes model-generated SQL for real against three engines. Only the PostgreSQL branch opened a read-only session; the Athena and Snowflake branches would have run a `CREATE TABLE AS` or an `INSERT`. A single read-only statement is now required for all three. |
-| `agentic_core/db_engine.py` | New `ensure_read_only_query()`: strips comments, rejects a second statement, requires `SELECT` or `WITH`. The pattern used elsewhere in this package, `sql.upper().startswith("DROP ")`, misses both `/*x*/DROP TABLE t` and `SELECT 1; DROP TABLE t`. |
+| `agentic_core/db_engine.py` | New `ensure_read_only_query()`: strips comments, rejects a second statement, requires `SELECT` or `WITH`. The pattern used elsewhere in this package, `sql.upper().startswith("DROP ")`, misses both `/*x*/DROP TABLE t` and `SELECT 1; DROP TABLE t`. Comments are removed by a single forward pass, not a regular expression — see below. |
 | `agentic_core/db_engine.py` | A Snowflake `private_key_path` from a data-source config was opened directly. It is now resolved and, if `AGENTIC_AUTO_KEY_DIR` is set, confined to that directory. A bad path still falls back to password auth so a stale config does not break a working deployment, but the fallback is logged. |
 | `agentic_core/authing_auth.py` | Logged the email address of every auto-created SSO user in clear text. |
+
+### A defect introduced by this change, and removed again
+
+The first version of `ensure_read_only_query()` stripped block comments with
+`/\*.*?\*/`. CodeQL flagged it as `py/polynomial-redos`, and the flag was right:
+`"/*a"` repeated 20,000 times took **2.9 seconds**, because every start position
+rescans to the end of the input before failing. Rewriting the pattern made it
+*worse* (8.1 seconds) — the cost is in the number of start positions, not the
+shape of the inner match.
+
+It is now a single forward pass whose index only ever advances, so it is linear
+by construction. The same payload takes **0.1 ms**. The pass also tracks quoted
+text, which the regular expression did not: a semicolon inside a string literal
+is no longer counted as a second statement, and unterminated quoting is refused
+rather than ignored.
 
 ### Assessed and deliberately not changed
 
@@ -200,10 +215,27 @@ CodeQL reports `py/sql-injection` at the `SELECT COUNT(*)` calls in
 is correct; CodeQL does not model it. These are false positives and are left in
 place rather than worked around.
 
+Four `py/full-ssrf` alerts are **dismissed as "won't fix", not fixed in code**,
+and that distinction matters. The finding is accurate as stated: the URL does
+depend on a user-provided value, because these endpoints exist to test a URL the
+operator supplies. What is gone is the exploitable consequence — `net_guard.py`
+resolves the name and checks every address before connecting, and refuses
+redirects. CodeQL cannot see that as a barrier: the check happens at run time
+against DNS, so it is not statically provable, and this repository uses CodeQL
+default setup, which does not read a custom model pack. The twelve
+request-forgery checks in `tests/test_hardening_regression.py` are what verify
+the claim; they call the guard for real.
+
+The same reasoning covers the dismissed `py/weak-sensitive-data-hashing` alert on
+the legacy SHA-256 branch of `_verify_password`, which exists only so that
+accounts created before this change can still log in and be upgraded, and the two
+`py/path-injection` alerts inside `resolve_private_key_path` itself, which has to
+touch the path in order to vet it.
+
 ### Verifying
 
 ```bash
-python tests/test_hardening_regression.py   # 22 checks
+python tests/test_hardening_regression.py   # 24 checks
 python tests/test_auth_regression.py        #  9 checks
 ```
 

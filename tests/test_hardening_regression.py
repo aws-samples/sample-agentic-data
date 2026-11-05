@@ -359,23 +359,27 @@ def _():
 
 # ──────────────────────── read-only SQL guard ────────────────────────
 
-@check("only a single SELECT or WITH statement may be dry-run")
-def _():
+def _sql_guard():
     import re as _re
     src = _source("agentic_core/db_engine.py")
-    chunk = src[src.index("_SQL_COMMENT = re.compile"):src.index("def resolve_private_key_path")]
+    chunk = src[src.index("class UnterminatedSQL"):src.index("def resolve_private_key_path")]
     ns = {"re": _re}
     exec(compile(chunk, "db_engine_guard", "exec"), ns)
-    guard = ns["ensure_read_only_query"]
+    return ns["ensure_read_only_query"]
 
+
+@check("only a single SELECT or WITH statement may be dry-run")
+def _():
+    guard = _sql_guard()
     for sql in ("SELECT * FROM orders", "WITH t AS (SELECT 1) SELECT * FROM t",
-                "  select a from b ;  ", "(SELECT 1)"):
+                "  select a from b ;  ", "(SELECT 1)", "SELECT 1; -- trailing comment"):
         guard(sql)
 
     for sql, label in [
         ("SELECT 1; DROP TABLE users", "a second statement"),
         ("/*x*/DROP TABLE users", "a DROP hidden behind a block comment"),
         ("-- ok\nDELETE FROM orders", "a DELETE hidden behind a line comment"),
+        ("SELECT 1 /* ; */ ; DROP TABLE t", "a semicolon outside a comment"),
         ("CREATE TABLE AS SELECT * FROM x", "CREATE TABLE AS SELECT"),
         ("INSERT INTO t VALUES (1)", "INSERT"),
         ("UPDATE t SET a=1", "UPDATE"),
@@ -386,6 +390,46 @@ def _():
         except ValueError:
             continue
         raise AssertionError(f"{label} was allowed")
+
+
+@check("quoted text is not mistaken for a comment or a statement separator")
+def _():
+    guard = _sql_guard()
+    # The regex this replaced did not know about quoting, so a semicolon inside a
+    # string literal counted as a second statement and a legitimate query was
+    # refused.
+    for sql in ("SELECT '; DROP TABLE t' AS s",
+                "SELECT '--not a comment' AS s",
+                "SELECT 'it''s fine' AS s",
+                'SELECT "weird;col" FROM t'):
+        guard(sql)
+
+    # Unterminated quoting fails closed: otherwise a trailing statement could
+    # hide inside what looks like an open string literal.
+    for sql, label in [("SELECT 1' ; DROP TABLE t", "an unterminated quote"),
+                       ("SELECT 1 /* unterminated", "an unterminated block comment")]:
+        try:
+            guard(sql)
+        except ValueError:
+            continue
+        raise AssertionError(f"{label} was allowed")
+
+
+@check("comment stripping is linear, not quadratic, in the input")
+def _():
+    import time
+    guard = _sql_guard()
+    # /\*.*?\*/ took 2.9 s on "/*a" repeated 20,000 times: every start position
+    # rescans to the end of the input before failing. The scanner that replaced it
+    # only ever moves forward.
+    for payload in ("/*a" * 20000, "/*" + "a/*" * 30000, "--a" * 50000):
+        started = time.time()
+        try:
+            guard("SELECT 1 " + payload)
+        except ValueError:
+            pass
+        elapsed = time.time() - started
+        assert elapsed < 1.0, f"took {elapsed:.1f}s on a {len(payload)}-character payload"
 
 
 @check("the SQL dry-run path applies the guard before choosing an engine")

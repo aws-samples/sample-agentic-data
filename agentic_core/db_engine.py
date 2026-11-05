@@ -23,13 +23,111 @@ def _safe_identifier(name: str) -> str:
     return name
 
 
-# Comment forms that can hide a keyword from a naive prefix check:
-# -- to end of line, and /* ... */ anywhere.
-_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+# Comments are stripped by a single forward pass rather than a regular
+# expression. The obvious pattern for a block comment, /\*.*?\*/, is quadratic
+# in the number of unterminated "/*" occurrences -- "/*a" repeated 20,000 times
+# took 2.9 seconds, because each start position rescans to the end of the input
+# before failing. Rewriting the pattern does not help; the cost is in the number
+# of start positions, not the shape of the inner match. A scanner whose index
+# only ever moves forward is linear by construction.
+#
+# The pass also tracks quoted text, which the regular expression did not. That
+# matters for the statement count below: a semicolon inside a string literal is
+# not a statement separator, and `SELECT '; DROP TABLE t'` is one statement.
+
+
+class UnterminatedSQL(ValueError):
+    """A quote or block comment was opened and never closed."""
 
 
 def strip_sql_comments(sql: str) -> str:
-    return _SQL_COMMENT.sub(" ", sql or "")
+    """Replace every comment with a space, leaving quoted text untouched.
+
+    Raises UnterminatedSQL for an unclosed quote or block comment. Those are
+    never valid SQL, and leaving them in place would let a trailing statement
+    hide inside what looks like an open string literal.
+    """
+    text = sql or ""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch == "'" or ch == '"':
+            quote = ch
+            out.append(ch)
+            i += 1
+            while True:
+                if i >= n:
+                    raise UnterminatedSQL(f"Unterminated {quote} quoted text")
+                if text[i] == quote:
+                    # Doubled quote is an escaped quote, not the end.
+                    if i + 1 < n and text[i + 1] == quote:
+                        out.append(text[i:i + 2])
+                        i += 2
+                        continue
+                    out.append(quote)
+                    i += 1
+                    break
+                out.append(text[i])
+                i += 1
+            continue
+
+        if ch == "-" and i + 1 < n and text[i + 1] == "-":
+            # Line comment. Keep the newline so line structure survives.
+            end = text.find("\n", i)
+            if end == -1:
+                out.append(" ")
+                break
+            out.append(" ")
+            i = end
+            continue
+
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            if end == -1:
+                raise UnterminatedSQL("Unterminated block comment")
+            out.append(" ")
+            i = end + 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def split_sql_statements(sql: str) -> list:
+    """Split on semicolons that are not inside quoted text. Comments removed first."""
+    cleaned = strip_sql_comments(sql)
+    parts, current = [], []
+    i, n = 0, len(cleaned)
+    while i < n:
+        ch = cleaned[i]
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            i += 1
+            while i < n:
+                current.append(cleaned[i])
+                if cleaned[i] == quote:
+                    if i + 1 < n and cleaned[i + 1] == quote:
+                        current.append(cleaned[i + 1])
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == ";":
+            parts.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    parts.append("".join(current))
+    return [part for part in parts if part.strip()]
 
 
 def ensure_read_only_query(sql: str) -> str:
@@ -47,9 +145,7 @@ def ensure_read_only_query(sql: str) -> str:
     if not sql or not str(sql).strip():
         raise ValueError("Empty SQL statement")
 
-    stripped = strip_sql_comments(str(sql)).strip()
-    # A trailing semicolon is normal; anything after it is a second statement.
-    statements = [part for part in stripped.rstrip(";").split(";") if part.strip()]
+    statements = split_sql_statements(str(sql))
     if len(statements) > 1:
         raise ValueError("Only a single SQL statement may be executed")
     if not statements:
