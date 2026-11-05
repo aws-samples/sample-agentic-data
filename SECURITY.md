@@ -532,3 +532,17 @@ takes the lockfile to a single entry and the advisories disappear rather than
 needing a future bump of a package nobody runs.
 
 `npm audit` in `web/`: **clean**.
+
+### What is left, and why it stays
+
+Three advisories remain: one medium, two low. Two of the three cannot be fixed
+from this repository, and saying so is more useful than leaving them to look
+neglected.
+
+| Package | Severity | Why it stays |
+|---|---|---|
+| `minimatch` 10.2.6 | medium | **Not fixable downstream.** It is a *bundled* dependency of `aws-cdk-lib` — `inBundle: true`, shipped inside that package's tarball — so npm `overrides` cannot reach it. `aws-cdk-lib` 2.275.0 is the current release. This closes when AWS publishes a version bundling `minimatch` ≥ 11.0.1. An override was tried, had no effect, and was removed rather than left in place looking like a fix. |
+| `deepmerge` 4.3.1 | low | **No patch exists.** 4.3.1 is the latest published version; the advisory has no `first_patched_version`. Development scope, reached only through the test runner. |
+| `@babel/core` | low | Fixed — overridden to `^7.29.6`, resolves to 7.29.13. |
+
+`npm audit` in `cdk/`: 0 critical, 0 high, 10 moderate, 4 low.
