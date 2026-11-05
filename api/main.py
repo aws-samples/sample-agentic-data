@@ -2466,7 +2466,7 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
             try:
                 from urllib.request import urlopen, Request
                 import json as _j
-                url = domain.rstrip("/") + "/_cat/indices?format=json"
+                url = validate_outbound_url(domain.rstrip("/") + "/_cat/indices?format=json")
                 req = Request(url, headers={"Content-Type": "application/json"})
                 resp = safe_urlopen(req, timeout=10)
                 indices = _j.loads(resp.read())
