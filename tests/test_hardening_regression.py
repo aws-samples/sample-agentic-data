@@ -15,6 +15,7 @@ the endpoint-level facts are asserted against the source text; the guards
 themselves are imported and called for real.
 """
 import ast
+import functools
 import hashlib
 import importlib.util
 import os
@@ -74,16 +75,23 @@ def _install_light_agentic_core():
     pkg.__path__ = [os.path.join(ROOT, "agentic_core")]
     pkg.__test_stub__ = True
     sys.modules["agentic_core"] = pkg
-    spec = importlib.util.spec_from_file_location(
-        "agentic_core.errors", os.path.join(ROOT, "agentic_core", "errors.py")
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agentic_core.errors"] = module
-    spec.loader.exec_module(module)
-    pkg.errors = module
+    for name in ("errors", "net_guard"):
+        spec = importlib.util.spec_from_file_location(
+            f"agentic_core.{name}", os.path.join(ROOT, "agentic_core", f"{name}.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[f"agentic_core.{name}"] = module
+        spec.loader.exec_module(module)
+        setattr(pkg, name, module)
 
 
 _install_light_agentic_core()
+
+
+@functools.lru_cache(maxsize=1)
+def _db_engine():
+    """agentic_core.db_engine, imported once through the stand-in package."""
+    return _load("agentic_core/db_engine.py", "agentic_core.db_engine")
 
 
 # ───────────────────────── the import break ─────────────────────────
@@ -390,12 +398,15 @@ def _():
 # ──────────────────────── read-only SQL guard ────────────────────────
 
 def _sql_guard():
-    import re as _re
-    src = _source("agentic_core/db_engine.py")
-    chunk = src[src.index("class UnterminatedSQL"):src.index("def resolve_private_key_path")]
-    ns = {"re": _re}
-    exec(compile(chunk, "db_engine_guard", "exec"), ns)
-    return ns["ensure_read_only_query"]
+    """The real ensure_read_only_query, imported rather than exec'd.
+
+    This used to cut the function out of db_engine.py by string index and exec
+    the slice, so the suite needed no agent runtime. The light package stand-in
+    installed above makes a plain import work instead -- which also means a
+    mis-cut slice can no longer pass silently, and there is no exec() in a file
+    that runs in CI.
+    """
+    return _db_engine().ensure_read_only_query
 
 
 @check("only a single SELECT or WITH statement may be dry-run")
@@ -477,17 +488,12 @@ def _():
 
 @check("a private key path outside the configured directory is refused")
 def _():
-    import re as _re
-    src = _source("agentic_core/db_engine.py")
-    chunk = src[src.index("def resolve_private_key_path"):src.index("class SQLEngine")]
-    ns = {"os": os, "re": _re}
-    exec(compile(chunk, "db_engine_keypath", "exec"), ns)
-    resolve = ns["resolve_private_key_path"]
+    resolve = _db_engine().resolve_private_key_path
 
     import tempfile
     with tempfile.TemporaryDirectory() as root:
         inside = os.path.join(root, "snowflake.pem")
-        with open(inside, "w") as fh:
+        with open(inside, "w", encoding="utf-8") as fh:
             fh.write("x")
         os.environ["AGENTIC_AUTO_KEY_DIR"] = root
         try:

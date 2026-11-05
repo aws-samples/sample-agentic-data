@@ -936,7 +936,7 @@ def handler(event, context):
             'id': f'deploy-rds-{rds_engine}',
             'name': f'{rds_engine.upper()} ({rds_database})',
             'type': 'RDS',
-            'icon': '\U0001f42c' if rds_engine == 'mysql' else '\U0001f418',
+            'icon': '\\U0001f42c' if rds_engine == 'mysql' else '\\U0001f418',
             'config': {
                 'engine': rds_engine,
                 'host': rds_host,
@@ -954,7 +954,7 @@ def handler(event, context):
             'id': 'deploy-athena',
             'name': f'Athena ({athena_db})',
             'type': 'Athena',
-            'icon': '\U0001f4ca',
+            'icon': '\\U0001f4ca',
             'config': {
                 'database': athena_db,
                 'region': os.environ.get('AWS_REGION', os.environ.get('AWS_DEFAULT_REGION', '')),

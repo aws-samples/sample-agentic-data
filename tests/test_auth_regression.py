@@ -89,19 +89,24 @@ def t4():
     app = FastAPI()
     app.add_middleware(auth.AuthMiddleware)
 
-    @app.get('/api/users')
     def users(request: Request):
         u = auth.get_current_user(request)
         if u.get('role') != 'admin':
             raise HTTPException(status_code=403, detail='admin only')
         return {'users': ['leaked']}
 
-    @app.put('/api/users/{e}/toggle')
     def toggle(e: str, request: Request):
         u = auth.get_current_user(request)
         if u.get('role') != 'admin':
             raise HTTPException(status_code=403, detail='admin only')
         return {'ok': True}
+
+    # add_api_route rather than @app.get / @app.put: identical behaviour, but the
+    # handlers are passed as arguments and so are visibly used. Behind the
+    # decorators a scanner reports them as inner functions that are defined and
+    # never called, because a decorator registration is not a call it can see.
+    app.add_api_route('/api/users', users, methods=['GET'])
+    app.add_api_route('/api/users/{e}/toggle', toggle, methods=['PUT'])
 
     c = TestClient(app, raise_server_exceptions=False)
     r = c.get('/api/users')

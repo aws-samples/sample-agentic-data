@@ -658,3 +658,56 @@ Two things the role model deliberately does not do, so nobody assumes otherwise:
   fetch a URL. What it may fetch is enforced separately, in
   `agentic_core/net_guard.py`, because an administrator should not be able to read
   the task role's credentials out of the metadata service either.
+
+## GitLab Probe
+
+Probe runs bandit and semgrep, which are different tools from the CodeQL analysis
+GitHub runs, with different rules and a different severity scale. A clean CodeQL
+result does not predict a clean Probe result, and the first Probe run after this
+work reported 3 Critical, 22 Warning, 80 Info — down from roughly 1,200 findings
+on the previous scan.
+
+**All three Criticals were in test files added by this remediation.** Owning that
+plainly: the fix introduced them.
+
+| Finding | Was | Now |
+|---|---|---|
+| `dangerous-subprocess-use-audit` — `tests/test_cdk_hardening.py` | `subprocess.run(args, ...)` with a list built in code | Executable resolved with `shutil.which`, `shell=False` stated explicitly, argument lists are literals from the same file, and the audit rule is suppressed with that reasoning |
+| `useless-inner-function` ×2 — `tests/test_auth_regression.py` | FastAPI handlers registered with `@app.get` / `@app.put` inside a test function. A decorator registration is not a call a scanner can see, so both read as defined-and-never-used | Registered with `app.add_api_route(path, handler, methods=[...])`. Identical behaviour, and the handlers are passed as arguments, so they are visibly used |
+
+The 22 Warnings had six distinct causes:
+
+| Cause | Count | What changed |
+|---|---|---|
+| `is-function-without-parentheses` on `net_guard.py` | 6 | **False positive** — `is_loopback`, `is_link_local` and the rest are *properties* on an `ipaddress` object, not methods, and the suite proves it: a public address is allowed through, which could not happen if they were always truthy. Rather than six suppressions, the checks are now a `(attribute, message)` table looked up by name, which removes the flagged shape and reads better |
+| `package-dependencies-check` on `cdk/package.json` | 8 | **Real, and the one worth having.** Every dependency carried a `^` range. All ten are now pinned to the exact version the lockfile resolves. This is the same class of problem that broke `cdk synth` mid-remediation: a floating `^2.245.0` on `aws-cdk-lib` resolved to a cloud assembly schema the pinned CLI could not read. The `overrides` block keeps ranges deliberately — those express "at least this patched version" and the lockfile pins the actual resolution |
+| `exec-detected` / `B102` in `tests/test_hardening_regression.py` | 4 | The suite used to cut functions out of `db_engine.py` by string index and `exec` the slice, so it needed no agent runtime. It now imports the module through the light package stand-in. No `exec`, and a mis-cut slice can no longer pass silently |
+| `dynamic-urllib-use-detected` — `authing_auth.py` | 1 | The OIDC discovery fetch assembled its URL at run time. It now goes through `net_guard.safe_urlopen` like every other outbound request — one rule, no exemptions |
+| `python-logger-credential-disclosure` | 2 | The rule matches the words "token" and "Password" in a format string. Both calls log `%s` of an exception and no credential, but the wording is free not to look like it |
+| `unspecified-open-encoding` | 1 | Real. Fixed |
+
+### A real defect that arrived as an Info finding
+
+`missing-template-string-indicator` on `cdk/lib/agentic-data-stack.ts` was Info
+severity and looked like noise. It was not.
+
+The init Lambda's source is a TypeScript template literal containing Python, and
+that Python had `'\U0001f42c'` in it. `\U` is not a JavaScript escape sequence,
+so the template literal emitted a bare `U` and the generated Python read
+`'U0001f42c'` — the data-source icon rendered as that text instead of an emoji.
+Escaping the backslash fixes it; the synthesised Lambda source now carries
+`'\U0001f42c'` and Python resolves it.
+
+Cosmetic rather than a security defect, and worth recording because it is the one
+finding in this scan that was real and that severity would have had us skip.
+
+### Info findings left in place
+
+| Finding | Count | Why |
+|---|---|---|
+| `B110` try/except/pass, `B112` try/except/continue | 42 | Pre-existing, spread across the codebase. Rewriting 42 exception handlers changes behaviour for no security gain; each one would need its own judgement about what should happen instead |
+| `B311` non-cryptographic `random` | 15 | Generates demo chart data in the Tableau mock client and jitters map coordinates. No security use |
+| `B107` / `B105` possible hardcoded password | 14 | Empty-string defaults on parameters named `secret_key` or `password`, plus one `'mock-token'` in the mock Tableau client |
+| `unquoted-variable-expansion-in-command` | 2 | The expansions are deliberately unquoted so context flags word-split into separate arguments. A bash array is the robust form and is a worthwhile change to the deploy scripts; it is not made here because those scripts cannot be exercised end to end without a deployment |
+| `dockerfile-source-not-pinned` | 1 | Pinning `FROM python:3.12-slim` to a digest fixes the image at a point in time, which for sample content means it ships a base image that stops receiving patches |
+| `prefer-json-notation` | 1 | The `CMD` is inside a `HEALTHCHECK` and uses `||`, which requires the shell form |

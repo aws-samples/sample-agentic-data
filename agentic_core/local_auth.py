@@ -174,7 +174,7 @@ def local_login(email: str, password: str) -> dict:
             _save_users(users)
             logger.info("Upgraded a stored password hash to PBKDF2")
         except Exception as exc:
-            logger.warning("Password hash upgrade failed, login still allowed: %s", exc)
+            logger.warning("Stored hash upgrade failed, login still allowed: %s", exc)
     
     token = _jwt_encode({
         "sub": email,

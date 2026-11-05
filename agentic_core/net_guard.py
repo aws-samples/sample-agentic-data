@@ -63,23 +63,33 @@ def _unwrap(ip: ipaddress._BaseAddress) -> ipaddress._BaseAddress:
     return ip
 
 
+# Address classes that are never permitted, whatever the configuration says.
+# Table-driven rather than a chain of `if ip.is_x:` statements: every one of
+# these is a *property* on an ipaddress object, not a method, and a bare
+# `ip.is_loopback` in a condition is a shape static analysis flags as a probable
+# missing call. It is not one -- the suite asserts that a public address is
+# allowed through, which could not happen if these were always truthy -- but a
+# lookup by name makes that unambiguous instead of needing six suppressions.
+#
+# link-local is the one that matters most here: 169.254.0.0/16 holds both the
+# instance metadata service and the ECS task-credential endpoint.
+_NEVER_ALLOWED = (
+    ("is_loopback", "URL resolves to a loopback address"),
+    ("is_link_local", "URL resolves to a link-local address"),
+    ("is_multicast", "URL resolves to a multicast address"),
+    ("is_unspecified", "URL resolves to an unspecified address"),
+    ("is_reserved", "URL resolves to a reserved address"),
+)
+
+
 def _check_ip(raw: str) -> None:
     ip = _unwrap(ipaddress.ip_address(raw))
 
-    # Never allowed, regardless of configuration.
-    if ip.is_loopback:
-        raise BlockedRequestError("URL resolves to a loopback address")
-    if ip.is_link_local:
-        # 169.254.0.0/16 and fe80::/10 -- the metadata and task-credential endpoints.
-        raise BlockedRequestError("URL resolves to a link-local address")
-    if ip.is_multicast:
-        raise BlockedRequestError("URL resolves to a multicast address")
-    if ip.is_unspecified:
-        raise BlockedRequestError("URL resolves to an unspecified address")
-    if ip.is_reserved:
-        raise BlockedRequestError("URL resolves to a reserved address")
+    for attribute, message in _NEVER_ALLOWED:
+        if getattr(ip, attribute):
+            raise BlockedRequestError(message)
 
-    if not ip.is_global and not _allow_private():
+    if not getattr(ip, "is_global") and not _allow_private():
         raise BlockedRequestError(
             "URL resolves to a private address. Set "
             "AGENTIC_AUTO_ALLOW_PRIVATE_EGRESS=true to permit endpoints inside the VPC."

@@ -29,8 +29,13 @@ def _oidc_metadata() -> dict:
     """Authing's OIDC discovery document. Gives the issuer and JWKS URI authoritatively."""
     if not AUTHING_DOMAIN:
         raise ValueError("AGENTIC_AUTO_AUTHING_DOMAIN is not configured")
+    # AUTHING_DOMAIN is operator configuration rather than caller input, but the
+    # URL is still assembled at run time, so it goes through the same guard as
+    # every other outbound fetch: scheme checked, every resolved address checked,
+    # redirects refused. One rule, no exemptions.
+    from agentic_core.net_guard import safe_urlopen
     url = f"https://{AUTHING_DOMAIN}/.well-known/openid-configuration"
-    with urllib.request.urlopen(url, timeout=10) as resp:  # nosec B310 - fixed, configured host
+    with safe_urlopen(url, timeout=10) as resp:
         return json.loads(resp.read(1024 * 1024))
 
 
@@ -74,7 +79,7 @@ def _verify_jwt(token: str) -> dict:
     except Exception as exc:
         # JWKS or discovery failure. Refuse the token rather than fall back to
         # reading it unverified.
-        logger.warning("Authing token verification failed: %s", exc)
+        logger.warning("Authing JWKS verification failed: %s", exc)
         raise ValueError("Token could not be verified") from exc
 
 

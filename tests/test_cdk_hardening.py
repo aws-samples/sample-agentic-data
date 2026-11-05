@@ -16,11 +16,17 @@ that reason rather than passing silently.
 """
 import json
 import os
-import subprocess
+import shutil
+import subprocess  # nosec B404
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CDK = os.path.join(ROOT, "cdk")
+
+# Resolved to an absolute path rather than relying on PATH lookup: a relative
+# executable name is resolved against whatever PATH happens to hold when this
+# runs, which is not something a test should leave to chance.
+NPX = shutil.which("npx")
 
 PASSED, FAILED = [], []
 
@@ -38,10 +44,15 @@ def synth():
     if not os.path.isdir(os.path.join(CDK, "node_modules")):
         print("SKIP: cdk/node_modules is absent. Run `npm install` in cdk/ first.")
         sys.exit(0)
+    if not NPX:
+        print("SKIP: npx is not on PATH.")
+        sys.exit(0)
     # Runs the cdk_nag plugin too, so a non-zero exit is itself a finding.
-    proc = subprocess.run(
-        ["npx", "cdk", "synth", "--json"],
-        cwd=CDK, capture_output=True, text=True, timeout=900,
+    # Every element is a literal defined in this file; nothing here comes from
+    # outside the process, and shell=False means no shell parses any of it.
+    proc = subprocess.run(  # nosec B603 B607
+        [NPX, "cdk", "synth", "--json"],
+        cwd=CDK, capture_output=True, text=True, timeout=900, shell=False,
     )
     if proc.returncode != 0:
         print("FAIL  cdk synth exited non-zero. cdk_nag findings, or a synth error:")
@@ -224,10 +235,16 @@ check("the deployment circuit breaker is enabled",
 
 # ── the TLS and public-exposure invariants, by synthesising again ───
 def synth_with(ctx, expect_failure=False):
-    args = ["npx", "cdk", "synth", "--json"]
+    # The context keys and values are literals from the two call sites below, so
+    # the argument list is fully determined by this file. shell=False, so the
+    # list is passed to execve as-is and nothing parses it as a command line.
+    args = [NPX, "cdk", "synth", "--json"]
     for k, v in ctx.items():
         args += ["-c", f"{k}={v}"]
-    proc = subprocess.run(args, cwd=CDK, capture_output=True, text=True, timeout=900)
+    # nosemgrep: dangerous-subprocess-use-audit
+    proc = subprocess.run(  # nosec B603
+        args, cwd=CDK, capture_output=True, text=True, timeout=900, shell=False,
+    )
     if expect_failure:
         return proc.returncode != 0, proc.stderr
     if proc.returncode != 0:
