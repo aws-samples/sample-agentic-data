@@ -23,5 +23,11 @@
   "dependencies": {
     "aws-cdk-lib": "^2.245.0",
     "constructs": "^10.6.0"
+  },
+  "overrides": {
+    "js-yaml@^3": "^3.15.2",
+    "brace-expansion@^1": "^1.1.16",
+    "brace-expansion@^2": "^2.1.2",
+    "browserslist": "^4.28.7"
   }
 }

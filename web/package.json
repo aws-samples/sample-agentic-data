@@ -1,15 +1,12 @@
 {
   "name": "web",
   "version": "1.0.0",
-  "description": "",
+  "description": "Static assets served by the API. No build step: index.html loads a vendored Babel bundle in the browser. Kept dependency-free on purpose.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "@babel/preset-react": "^7.28.5"
-  }
+  "license": "ISC"
 }

@@ -479,3 +479,56 @@ The reference in an error message is the only part worth copying out of a UI
 toast: it is what ties a user's report to the log line holding the real cause.
 Searching CloudWatch for `err:<reference>` returns the exception and its
 traceback.
+
+## Dependency alerts
+
+Dependabot reported 8 high-severity advisories. All eight were
+resource-exhaustion or crash conditions in build tooling, reachable only by a
+build that processes untrusted input, which neither of these manifests does. They
+are fixed anyway, because "unreachable in this configuration" is an argument that
+stops being true the moment someone adds a step.
+
+### `cdk/`
+
+`js-yaml`, `brace-expansion` and `browserslist` all arrived transitively, through
+`ts-jest` and through `aws-cdk-lib`'s `minimatch`. Pinned with npm `overrides`
+rather than `npm audit fix`:
+
+```json
+"overrides": {
+  "js-yaml@^3": "^3.15.2",
+  "brace-expansion@^1": "^1.1.16",
+  "brace-expansion@^2": "^2.1.2",
+  "browserslist": "^4.28.7"
+}
+```
+
+`npm audit fix` is what to avoid here. Run earlier in this work, it floated
+`aws-cdk-lib` to a cloud assembly schema the pinned CLI could not read, and
+`cdk synth` stopped working with an error that says nothing about dependencies.
+Version-scoped overrides change exactly the packages named.
+
+`npm audit` in `cdk/`: **0 critical, 0 high**, 10 moderate and 5 low remaining.
+
+### `web/`
+
+The two `browserslist` advisories here were reported against `dependencies`
+rather than `devDependencies`, so they read as runtime exposure. They were not,
+and the fix is not a version bump.
+
+`web/package.json` declared one dependency, `@babel/preset-react`, and nothing
+used it:
+
+- `web/` contains HTML and SVG. There is no bundler, no `babel.config.js`, and no
+  build script.
+- `web/index.html` loads Babel in the browser, from a bundle vendored at
+  `web/vendor/babel.min.js`. `@babel/preset-react` is a Node-side preset for a
+  build step that does not exist.
+- `deploy/.dockerignore` excludes `web/package*.json` from the image.
+- Both `npm install` instructions in the README are `cd cdk`.
+
+So the dependency was dead, and `browserslist` came in behind it. Removing it
+takes the lockfile to a single entry and the advisories disappear rather than
+needing a future bump of a package nobody runs.
+
+`npm audit` in `web/`: **clean**.
