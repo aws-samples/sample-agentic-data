@@ -546,3 +546,115 @@ neglected.
 | `@babel/core` | low | Fixed — overridden to `^7.29.6`, resolves to 7.29.13. |
 
 `npm audit` in `cdk/`: 0 critical, 0 high, 10 moderate, 4 low.
+
+## The authorization model
+
+Requested by the Guardian on `D435608595` ("the default role shouldn't be 'full
+administrator' for every caller — please document the authorization model"). This
+is what it is after the changes above.
+
+### Identity
+
+`auth.py`'s `AuthMiddleware` runs on every request except a fixed list of public
+paths (`/`, `/health`, `/favicon.ico`, `/static/*`, and the five `/api/auth/*`
+endpoints that exist to establish a session). Everything else requires a token.
+
+Three providers, selected by `AGENTIC_AUTO_AUTH_PROVIDER`. **All three verify
+signatures:**
+
+| Provider | Token | Verification |
+|---|---|---|
+| `cognito` (default) | Cognito ID or access token | RS256 against the user pool's JWKS; signature, issuer, audience and expiry all enforced |
+| `authing` | Authing OIDC token | RS256 against Authing's JWKS, issuer and audience from its OIDC discovery document |
+| `local` | HS256 token minted by `local_auth` | HMAC with `AGENTIC_AUTO_JWT_SECRET`, which has no default and is read from Secrets Manager |
+
+A token that fails verification is rejected. There is no path that reads claims
+from an unverified token — that was the defect behind this ticket, and
+`tests/test_auth_regression.py` asserts it stays closed.
+
+### Roles
+
+Three: `admin`, `analyst`, `viewer`. The role is **never** taken from a
+caller-supplied field:
+
+- `local` and `authing`: the role comes from the user's record in DynamoDB, looked
+  up by the verified subject. An Authing token carries no role claim at all.
+- `cognito`: from the `custom:role` claim, which only the user pool can set, on a
+  token whose signature has been verified.
+
+`viewer` is the default for an identity with no role recorded. **There is no path
+that produces `admin` without an explicit role assignment.**
+
+### What each role can do
+
+Counted from the source: **40 of the 187 endpoints are administrator-only.**
+Thirteen through a `Depends(require_admin)` dependency, twenty-seven through an
+inline `role != "admin"` check. The remaining 147 are available to any verified
+identity.
+
+| | `viewer` | `analyst` | `admin` |
+|---|---|---|---|
+| Ask questions, read results, read dashboards | yes | yes | yes |
+| Submit feedback | yes | yes | yes |
+| Register, edit or delete a **data source** | no | no | yes |
+| Register or delete a **model endpoint** | no | no | yes |
+| Register or delete an **MCP server** | no | no | yes |
+| Run a connection **test** against a supplied URL | no | no | yes |
+| Verified-query queue (`/api/vqr/*`) — **including reads** | no | no | yes |
+| Alert and KPI rules (`/api/alert-rules`, `/api/kpi-rules`) | no | no | yes |
+| Feedback statistics, stored user memories | no | no | yes |
+| User management (`/api/users/*`) | no | no | yes |
+
+`viewer` and `analyst` are not distinguished by any check in the current code.
+Everything is either available to a verified identity or restricted to `admin`.
+Stated because the role list implies a three-tier model that the enforcement does
+not yet implement — `analyst` is a label, not a privilege level.
+
+The thirteen `Depends(require_admin)` endpoints are the three connection tests and
+the create/update/delete endpoints for models, data sources and MCP servers.
+`require_admin()` raises 403 unless the request carries a verified identity whose
+role is exactly `admin`; an identity flagged `unauthenticated` is refused
+whatever its role field says.
+
+The connection tests are administrator-gated **because of what they used to be
+able to do**, not only because they write configuration: they were the command
+execution and request forgery paths. Defence in depth, since both underlying
+defects are fixed as well.
+
+One oddity worth naming rather than leaving to be discovered:
+`POST /api/auth/change-password` is behind the same `role != "admin"` check, so a
+`viewer` cannot change their own password. That is over-restrictive rather than
+unsafe, and it is not changed here because loosening an authorization check is not
+something to do in a security fix without a reason to.
+
+### The disabled-authentication mode
+
+`AGENTIC_AUTO_AUTH_ENABLED=false` exists for local development. Four things
+constrain it, and the Guardian asked for the opt-out to be explicit, documented
+and warned about:
+
+1. Authentication is **on** unless the variable is the exact string `false`. A
+   typo, an empty value, or an unset variable all leave it on.
+2. With it off, `auth.py` **raises at import** if `AGENTIC_DATA_ENV` is
+   `production` — and `AGENTIC_DATA_ENV` itself defaults to `production`. A
+   deployment cannot reach the opt-out by accident.
+3. The identity injected in that mode is `viewer`, flagged `unauthenticated`. It
+   is refused by `require_admin()`. It used to be `admin`.
+4. The module logs a boxed warning at import saying every request runs
+   unauthenticated and that the process must not be exposed to a network.
+
+The CDK stack sets `AGENTIC_AUTO_AUTH_ENABLED: 'true'` explicitly on the Fargate
+task rather than relying on the library default — relying on a default is what
+produced the original defect.
+
+### Where authorization is *not* the control
+
+Two things the role model deliberately does not do, so nobody assumes otherwise:
+
+- **Row- and column-level data access.** A `viewer` who can ask questions can ask
+  about anything in a registered data source. Scoping by row or column is the
+  data source's job, through the credentials the data source is registered with.
+- **Outbound reachability.** `require_admin` limits *who* can ask the server to
+  fetch a URL. What it may fetch is enforced separately, in
+  `agentic_core/net_guard.py`, because an administrator should not be able to read
+  the task role's credentials out of the metadata service either.
