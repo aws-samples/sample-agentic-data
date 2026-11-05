@@ -26,6 +26,9 @@ from .tools import (
     manage_alert_rules, manage_kpi_rules,
 )
 from agentic_core.db_engine import _safe_identifier
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 _sub_agent_config_default = {"model_id": DEFAULT_SUB_AGENT_MODEL, "max_tokens": 2048}
 _sub_agent_local = threading.local()
@@ -497,7 +500,7 @@ def _parallel_cross_domain(question, base_prompt, all_tools, mcp_clients):
                              window_size=3, callback_handler=_ah)
             return r
         except Exception as e:
-            return f"[{_athena_name} 错误] {str(e)[:200]}"
+            return f"[{_athena_name} 错误] {safe_message(e, '_ah')}"
 
     def run_pg():
         try:
@@ -510,7 +513,7 @@ def _parallel_cross_domain(question, base_prompt, all_tools, mcp_clients):
                              window_size=3, callback_handler=_ph)
             return r
         except Exception as e:
-            return f"[{_pg_name} 错误] {str(e)[:200]}"
+            return f"[{_pg_name} 错误] {safe_message(e, '_ph')}"
 
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -786,7 +789,7 @@ def deep_data_analysis(question: str) -> str:
         import traceback
         print(f"[{_da_display_name}] EXCEPTION: {e}")
         traceback.print_exc()
-        _notify_sub(_da_display_name, "end", {"error": str(e)[:200]})
+        _notify_sub(_da_display_name, "end", {"error": safe_message(e, "_text_handler")})
         return "数据查询暂时无法完成，请用户重新提问或换个问法。"
 
 

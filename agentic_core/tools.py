@@ -20,6 +20,9 @@ from botocore.config import Config
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import REGION, EVENTS_TABLE, DATA_BUCKET, REPORTS_BUCKET, ATHENA_DATABASE, CONFIG_TABLE
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 
 def _emit_artifact(data):
@@ -789,7 +792,7 @@ def _run_mysql(sql, max_rows=500):
             total = cur.rowcount if cur.rowcount >= 0 else len(rows)
         return {"columns": cols, "rows": rows, "count": len(rows), "total": total}
     except Exception as e:
-        return {"error": str(e)[:500]}
+        return {"error": safe_message(e, "_run_mysql")}
 
 
 def _get_pg_conn():
@@ -857,7 +860,7 @@ def _run_pg(sql, max_rows=500):
         return {"columns": cols, "rows": rows, "count": len(rows), "total": total}
     except Exception as e:
         conn.rollback()
-        return {"error": str(e)[:500]}
+        return {"error": safe_message(e, "_run_pg")}
     finally:
         _release_pg_conn(conn)
 
@@ -952,7 +955,7 @@ def snowflake_query(question: str, sql: str) -> str:
         )
         result = engine.execute(sql, max_rows=500)
     except Exception as e:
-        result = {"error": str(e), "sql": sql}
+        result = {"error": safe_message(e, "snowflake_query"), "sql": sql}
 
     elapsed_ms = int((_t.time() - t0) * 1000)
     print(f"[SQL_AUDIT] engine=snowflake elapsed={elapsed_ms}ms sql={sql[:200]}")

@@ -10,6 +10,9 @@ import logging
 import re
 import boto3
 from typing import Optional
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 logger = logging.getLogger(__name__)
 
@@ -372,9 +375,9 @@ def _get_table_schemas(engine: str) -> str:
                         cols = [c["name"] for c in tinfo.get("columns", [])]
                         lines.append(f"  {tname}: [{', '.join(cols)}]")
             except Exception as e:
-                lines.append(f"  (Snowflake schema获取失败: {str(e)[:80]})")
+                lines.append(f"  (Snowflake schema获取失败: {safe_message(e, '_get_table_schemas')})")
     except Exception as e:
-        lines.append(f"  (获取失败: {str(e)[:80]})")
+        lines.append(f"  (获取失败: {safe_message(e, '_get_table_schemas')})")
     return "\n".join(lines) if lines else "  (未知)"
 
 
@@ -400,10 +403,10 @@ def _call_bedrock_judge(prompt: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError as e:
         logger.error(f"[VQR Judge] JSON parse error: {e}, raw: {text[:200]}")
-        return {"error": f"JSON parse error: {str(e)}", "raw": text[:200]}
+        return {"error": f"JSON parse error: {safe_message(e, '_call_bedrock_judge')}", "raw": text[:200]}
     except Exception as e:
         logger.error(f"[VQR Judge] Bedrock call error: {e}")
-        return {"error": str(e)}
+        return {"error": safe_message(e, "_call_bedrock_judge")}
 
 
 def _verify_sql_execution(sql: str, engine: str) -> dict:
@@ -419,7 +422,7 @@ def _verify_sql_execution(sql: str, engine: str) -> dict:
     try:
         ensure_read_only_query(sql)
     except ValueError as exc:
-        result["error"] = str(exc)
+        result["error"] = safe_message(exc, "_verify_sql_execution")
         return result
 
     try:
@@ -506,7 +509,7 @@ def _verify_sql_execution(sql: str, engine: str) -> dict:
                 result["sample_rows"] = sf_result.get("rows", [])[:3]
 
     except Exception as e:
-        result["error"] = str(e)[:200]
+        result["error"] = safe_message(e, "_verify_sql_execution")
 
     return result
 
@@ -548,7 +551,7 @@ def llm_judge(question: str, sql: str, engine: str = "athena",
             exec_result = _verify_sql_execution(sql, engine)
             logger.info(f"[VQR Judge] SQL exec: executable={exec_result.get('executable')}, rows={exec_result.get('row_count')}, error={exec_result.get('error')}")
         except Exception as e:
-            exec_result = {"executable": False, "error": str(e)[:200]}
+            exec_result = {"executable": False, "error": safe_message(e, "llm_judge")}
     result["exec_result"] = exec_result
 
     # ── Step 3: LLM-as-Judge (with real context) ──

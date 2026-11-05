@@ -12,6 +12,9 @@ import logging
 import boto3
 
 from config import CONFIG_TABLE, REGION
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +200,7 @@ def local_verify(token: str) -> dict:
             "sub": payload.get("sub", ""),
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "local_verify")}
 
 def local_create_user(email: str, password: str, role: str = "viewer") -> dict:
     """Create a new user."""

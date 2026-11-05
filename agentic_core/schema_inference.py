@@ -13,6 +13,9 @@ Schema Inference Engine — 自动从数据文件推断语义层定义。
 import json, csv, io, os, re
 from collections import Counter, defaultdict
 from datetime import datetime
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 
 # ═══════ 字段类型推断 ═══════
@@ -359,7 +362,7 @@ def parse_upload(content, filename):
                 return None, "JSON 格式不支持: 需要 [{...}, ...] 数组格式"
             return None, "JSON 格式不支持: 需要对象数组"
         except json.JSONDecodeError as e:
-            return None, f"JSON 解析失败: {e}"
+            return None, f"JSON 解析失败: {safe_message(e, 'parse_upload')}"
     
     elif ext == ".csv":
         try:
@@ -377,7 +380,7 @@ def parse_upload(content, filename):
                 return None, "CSV 为空"
             return data, None
         except Exception as e:
-            return None, f"CSV 解析失败: {e}"
+            return None, f"CSV 解析失败: {safe_message(e, 'parse_upload')}"
     
     elif ext in (".xlsx", ".xls"):
         try:
@@ -401,7 +404,7 @@ def parse_upload(content, filename):
         except ImportError:
             return None, "需要安装 openpyxl: pip install openpyxl"
         except Exception as e:
-            return None, f"Excel 解析失败: {e}"
+            return None, f"Excel 解析失败: {safe_message(e, 'parse_upload')}"
     
     elif ext in (".jsonl", ".ndjson"):
         # JSONL: one JSON object per line
@@ -417,7 +420,7 @@ def parse_upload(content, filename):
                 return None, "JSONL 为空"
             return data, None
         except Exception as e:
-            return None, f"JSONL 解析失败: {e}"
+            return None, f"JSONL 解析失败: {safe_message(e, 'parse_upload')}"
 
     elif ext == ".tsv":
         try:
@@ -434,7 +437,7 @@ def parse_upload(content, filename):
                 return None, "TSV 为空"
             return data, None
         except Exception as e:
-            return None, f"TSV 解析失败: {e}"
+            return None, f"TSV 解析失败: {safe_message(e, 'parse_upload')}"
 
     elif ext == ".parquet":
         try:
@@ -457,7 +460,7 @@ def parse_upload(content, filename):
         except ImportError:
             return None, "需要安装 pyarrow: pip install pyarrow"
         except Exception as e:
-            return None, f"Parquet 解析失败: {e}"
+            return None, f"Parquet 解析失败: {safe_message(e, 'parse_upload')}"
 
     elif ext == ".orc":
         try:
@@ -479,7 +482,7 @@ def parse_upload(content, filename):
         except ImportError:
             return None, "需要安装 pyarrow: pip install pyarrow"
         except Exception as e:
-            return None, f"ORC 解析失败: {e}"
+            return None, f"ORC 解析失败: {safe_message(e, 'parse_upload')}"
 
     else:
         return None, f"不支持的文件格式: {ext} (支持: .json, .jsonl, .csv, .tsv, .parquet, .orc, .xlsx)"
@@ -915,6 +918,6 @@ def introspect_tableau(client):
                     "summary": f"📊 **Tableau {view_name}** — {len(metrics)} 指标, {len(dimensions)} 维度",
                 })
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": safe_message(e, "introspect_tableau")}]
     
     return results

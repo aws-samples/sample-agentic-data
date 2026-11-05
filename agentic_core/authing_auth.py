@@ -10,6 +10,9 @@ import urllib.parse
 import logging
 import os
 from functools import lru_cache
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +163,12 @@ def exchange_code(code: str) -> dict:
             },
         }
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if e.fp else str(e)
+        error_body = safe_message(e, "exchange_code")
         logger.error(f"Authing token exchange failed: {error_body}")
         return {"ok": False, "error": f"Token exchange failed: {error_body}"}
     except Exception as e:
         logger.error(f"Authing token exchange error: {e}")
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": safe_message(e, "exchange_code")}
 
 
 def verify_token(token: str) -> dict:
@@ -178,7 +181,7 @@ def verify_token(token: str) -> dict:
     try:
         payload = _verify_jwt(token)
     except ValueError as exc:
-        return {"error": str(exc)}
+        return {"error": safe_message(exc, "verify_token")}
 
     email = payload.get("email", payload.get("phone_number", ""))
     # Always get role from DynamoDB — Authing JWT doesn't carry role
@@ -219,4 +222,4 @@ def refresh_tokens(refresh_token_str: str) -> dict:
         }
     except Exception as e:
         logger.error(f"Authing token refresh error: {e}")
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": safe_message(e, "refresh_tokens")}

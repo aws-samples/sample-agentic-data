@@ -13,6 +13,9 @@ Usage:
 import os, json, logging, time, csv, io
 from typing import Dict, List, Any, Optional
 from urllib.parse import urljoin
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +327,7 @@ class TableauClient:
 
         except Exception as e:
             logger.error(f"Failed to build Tableau semantic context: {e}")
-            context["error"] = str(e)
+            context["error"] = safe_message(e, "build_semantic_context")
 
         return context
 
@@ -378,7 +381,7 @@ class TableauClient:
                 }
             }
         except Exception as e:
-            return {"ok": False, "message": str(e), "details": {}}
+            return {"ok": False, "message": safe_message(e, "test_connection"), "details": {}}
 
 
 # ═══════ Demo/Mock Client (no real Tableau) ═══════

@@ -5,8 +5,33 @@ privilege escalation is gone. Exercises the middleware directly so it needs
 only fastapi, not the application's full dependency set.
 """
 import base64, json, os, pathlib, sys, time, importlib
+import importlib.util
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+# local_auth now imports agentic_core.errors. Resolving that normally would run
+# the real agentic_core/__init__.py, which pulls in strands and the whole agent
+# stack; errors itself needs only logging and uuid. Register a stand-in package
+# so the module can be loaded by path, as the checks below do.
+def _install_light_agentic_core():
+    import types
+    root = pathlib.Path(__file__).resolve().parent.parent
+    existing = sys.modules.get('agentic_core')
+    if existing is not None and getattr(existing, '__test_stub__', False):
+        return
+    pkg = types.ModuleType('agentic_core')
+    pkg.__path__ = [str(root / 'agentic_core')]
+    pkg.__test_stub__ = True
+    sys.modules['agentic_core'] = pkg
+    spec = importlib.util.spec_from_file_location(
+        'agentic_core.errors', str(root / 'agentic_core' / 'errors.py'))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['agentic_core.errors'] = module
+    spec.loader.exec_module(module)
+    pkg.errors = module
+
+
+_install_light_agentic_core()
 os.environ['AGENTIC_AUTO_JWT_SECRET'] = 'x' * 48   # local_auth refuses to load without one
 FAILED = []
 

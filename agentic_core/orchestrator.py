@@ -18,6 +18,9 @@ from typing import Optional, Callable
 from dataclasses import dataclass, field
 
 from agentic_core.agent_registry import get_agent_def, get_scene, list_agents
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 
 @dataclass
@@ -111,9 +114,9 @@ class Orchestrator:
             self._emit(ctx, agent_id, "agent_end", {"success": True})
             return result
         except Exception as e:
-            self._emit(ctx, agent_id, "run_error", {"error": str(e)})
+            self._emit(ctx, agent_id, "run_error", {"error": safe_message(e, "_mode_direct")})
             traceback.print_exc()
-            return f"Agent execution error: {e}"
+            return f"Agent execution error: {safe_message(e, '_mode_direct')}"
     
     # ─── Mode: Parallel ───
     
@@ -139,7 +142,7 @@ class Orchestrator:
                 return aid, r, None
             except Exception as e:
                 traceback.print_exc()
-                return aid, None, str(e)
+                return aid, None, safe_message(e, "_run_one")
         
         with ThreadPoolExecutor(max_workers=min(len(agent_ids), 4)) as executor:
             futures = {executor.submit(_run_one, aid): aid for aid in agent_ids}
@@ -203,8 +206,8 @@ class Orchestrator:
                 current_input = result  # Next agent gets this as input
                 self._emit(ctx, aid, "agent_end", {"step": i + 1, "success": True})
             except Exception as e:
-                self._emit(ctx, aid, "run_error", {"step": i + 1, "error": str(e)})
-                return f"Pipeline failed at step {i + 1} ({aid}): {e}"
+                self._emit(ctx, aid, "run_error", {"step": i + 1, "error": safe_message(e, "_mode_pipeline")})
+                return f"Pipeline failed at step {i + 1} ({aid}): {safe_message(e, '_mode_pipeline')}"
         
         return current_input
     

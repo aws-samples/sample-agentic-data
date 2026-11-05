@@ -12,6 +12,9 @@ import urllib.request
 import urllib.parse
 import logging
 from datetime import datetime, timezone
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         logger.error(f"POST {url[:60]}... failed: {e}")
-        return {"errcode": -1, "errmsg": str(e)}
+        return {"errcode": -1, "errmsg": safe_message(e, "_post_json")}
 
 
 def _markdown_to_plain(md: str, max_len: int = 2000) -> str:
@@ -275,7 +278,7 @@ def send_ses_email(recipients: list, title: str, content: str,
         return {
             "success": False,
             "channel": "ses",
-            "message": str(e),
+            "message": safe_message(e, "send_ses_email"),
             "raw": {},
         }
 
@@ -341,7 +344,7 @@ def send_notification(channel_config: dict, title: str, content: str) -> dict:
     try:
         return sender(title=title, content=content, **kwargs)
     except Exception as e:
-        return {"success": False, "channel": ch_type, "message": str(e)}
+        return {"success": False, "channel": ch_type, "message": safe_message(e, "send_notification")}
 
 
 def send_to_channels(channels: list, title: str, content: str) -> list:

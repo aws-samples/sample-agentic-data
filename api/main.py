@@ -32,6 +32,9 @@ from agentic_core.db_engine import _safe_identifier as _safe_id
 # On Fargate an unguarded fetch reaches the task role's credentials at
 # 169.254.170.2 and returns them in the response body.
 from agentic_core.net_guard import safe_urlopen, validate_outbound_url
+# Exception text is logged, never returned: str(e) in a response carries paths,
+# SQL, hostnames and sometimes a connection string with the password in it.
+from agentic_core.errors import safe_message
 from config import (REGION, EVENTS_TABLE, DATA_BUCKET, REPORTS_BUCKET,
     CHAT_TABLE, COST_TABLE, CONFIG_TABLE, FEEDBACK_TABLE,
     AUTH_ENABLED, COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION,
@@ -460,7 +463,7 @@ async def global_exception_handler(request, exc):
     logging.error(f"Unhandled exception: {exc}\n{traceback.format_exc()}")
     return JSONResponse(
         status_code=500,
-        content={"error": str(exc), "type": type(exc).__name__}
+        content={"error": safe_message(exc, "global_exception_handler")}
     )
 
 
@@ -675,7 +678,7 @@ def api_chatbi_overview():
                 "field_count": len(fields),
             })
         except Exception as e:
-            result.append({"name": name, "description": info.get("description", info.get("desc", "")), "record_count": 0, "error": str(e)})
+            result.append({"name": name, "description": info.get("description", info.get("desc", "")), "record_count": 0, "error": safe_message(e, "api_chatbi_overview")})
     return {"datasets": result, "total_datasets": len(result), "total_records": sum(d.get("record_count",0) for d in result)}
 
 @app.get("/api/chatbi/detail/{dataset}")
@@ -801,7 +804,7 @@ def api_delete_chat_history(session_id: str):
         _agents.pop(session_id, None)
         return {"ok": True, "deleted": len(resp.get("Items", []))}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": safe_message(e, "api_delete_chat_history")}
 
 class ChatRequest(BaseModel):
     message: str
@@ -1142,7 +1145,7 @@ async def api_chat(req: ChatRequest, request: Request):
                     # Cost: only DataAnalyst cost (no Supervisor)
                     agent_state["model"] = (_v2_agent_def.get("model_id", "").split(".")[-1] or "unknown")
                 except Exception as e:
-                    err_msg = str(e)
+                    err_msg = safe_message(e, "sub_trace")
                     print(f"[Orchestrator] Direct mode error: {err_msg}")
                     if "Deserialization" in err_msg:
                         _reset_deep_limit()
@@ -1197,8 +1200,8 @@ async def api_chat(req: ChatRequest, request: Request):
                             elapsed_ms = int((time.time() - _t_par) * 1000)
                             event_queue.put(("sub", json.dumps({"agent": aname, "type": "end", "data": f"{aname} 完成 ({elapsed_ms}ms)"})))
                         except Exception as e:
-                            _parallel_errors[aname] = str(e)
-                            event_queue.put(("sub", json.dumps({"agent": aname, "type": "error", "data": str(e)[:200]})))
+                            _parallel_errors[aname] = safe_message(e, "_run_one_agent")
+                            event_queue.put(("sub", json.dumps({"agent": aname, "type": "error", "data": safe_message(e, "_run_one_agent")})))
                 
                 total_par_ms = int((time.time() - _t_par) * 1000)
                 event_queue.put(("sub", json.dumps({"agent": "Orchestrator", "type": "end", "data": f"并行完成 ({total_par_ms}ms), {len(_parallel_results)} 成功, {len(_parallel_errors)} 失败"})))
@@ -1343,8 +1346,8 @@ async def api_chat(req: ChatRequest, request: Request):
                         _pipeline_input = f"基于以下上一步分析结果，继续:\n\n{_step_result}\n\n原始问题: {req.message}"
                         event_queue.put(("sub", json.dumps({"agent": aname, "type": "end", "data": f"{aname} 完成"})))
                     except Exception as e:
-                        _pipeline_results.append(f"## {aname}\n\n[错误] {str(e)[:200]}")
-                        event_queue.put(("sub", json.dumps({"agent": aname, "type": "error", "data": str(e)[:200]})))
+                        _pipeline_results.append(f"## {aname}\n\n[错误] {safe_message(e, '_run_one_agent')}")
+                        event_queue.put(("sub", json.dumps({"agent": aname, "type": "error", "data": safe_message(e, "_run_one_agent")})))
                         break  # Pipeline stops on error
                 
                 result_text = "\n\n---\n\n".join(_pipeline_results)
@@ -1396,7 +1399,7 @@ async def api_chat(req: ChatRequest, request: Request):
                 except Exception as _e:
                     print(f"[WARN] swallowed exception: {_e}")
         except Exception as e:
-            agent_state["error"] = str(e)
+            agent_state["error"] = safe_message(e, "_run_one_agent")
         finally:
             agent_state["done"] = True
 
@@ -1571,7 +1574,7 @@ def get_scenarios(request: Request):
             }
         return {"ok": True, "scenarios": result}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+        return {"ok": False, "error": safe_message(e, "get_scenarios")}
 
 @app.get("/api/scenarios/{scenario_id}")
 def get_scenario(scenario_id: str):
@@ -1588,7 +1591,7 @@ def get_scenario(scenario_id: str):
             return {"ok": False, "error": "场景不存在"}
         return {"ok": True, "scenario": s}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+        return {"ok": False, "error": safe_message(e, "get_scenario")}
 
 @app.put("/api/scenarios/{scenario_id}")
 def update_scenario(scenario_id: str, req: dict):
@@ -1611,7 +1614,7 @@ def update_scenario(scenario_id: str, req: dict):
         bump_data_version()
         return {"ok": True, "scenario": existing}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+        return {"ok": False, "error": safe_message(e, "update_scenario")}
 
 @app.delete("/api/scenarios/{scenario_id}")
 def delete_scenario(scenario_id: str):
@@ -1627,7 +1630,7 @@ def delete_scenario(scenario_id: str):
             bump_data_version()
         return {"ok": True}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+        return {"ok": False, "error": safe_message(e, "delete_scenario")}
 
 # ═══════════════════ V2 Agent Registry API ═══════════════════
 # 独立 Agent 实体 CRUD — 数据源/工具/prompt 绑定 Agent 而非 Scene
@@ -1712,7 +1715,7 @@ def api_v2_create_from_template(template_id: str, req: dict = None):
         agent = create_from_template(template_id, overrides=req)
         return {"ok": True, "agent": agent}
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=safe_message(e, "api_v2_create_from_template"))
 
 
 class ABTestRequest(BaseModel):
@@ -1753,7 +1756,7 @@ async def api_v2_ab_test(req: ABTestRequest, request: Request):
             result = deep_data_analysis(req.message)
             return {"text": result, "latency": round(time.time() - t0, 1), "error": None}
         except Exception as e:
-            return {"text": "", "latency": round(time.time() - t0, 1), "error": str(e)[:200]}
+            return {"text": "", "latency": round(time.time() - t0, 1), "error": safe_message(e, "run_agent")}
     
     results = {}
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2204,9 +2207,9 @@ def api_test_model(req: dict, _admin: dict = Depends(require_admin)):
         except: pass
         return JSONResponse({"status": "error", "latency_ms": elapsed, "message": f"HTTP {e.code}: {body_text}"}, 200)
     except urllib.error.URLError as e:
-        return JSONResponse({"status": "error", "message": f"连接失败: {str(e.reason)[:100]}"}, 200)
+        return JSONResponse({"status": "error", "message": f"连接失败: {safe_message(e, 'api_test_model')}"}, 200)
     except Exception as e:
-        return JSONResponse({"status": "error", "message": f"错误: {str(e)[:150]}"}, 200)
+        return JSONResponse({"status": "error", "message": f"错误: {safe_message(e, 'api_test_model')}"}, 200)
 
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
@@ -2346,7 +2349,7 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
                 schema_label = pg_schema if pg_schema else ', '.join(schemas_to_scan)
                 return {"ok": True, "message": f"连接成功 — {host}:{port}/{database} (schema: {schema_label})，{len(tables)} 张表: {', '.join(row_info)}", "tables": tables}
             except Exception as e:
-                return {"ok": False, "message": f"PostgreSQL 连接失败: {str(e)[:200]}"}
+                return {"ok": False, "message": f"PostgreSQL 连接失败: {safe_message(e, 'api_datasource_test')}"}
         elif ds_type == "RDS":
             engine = config.get("engine", "mysql").lower()
             host = config.get("host", req.get("host", ""))
@@ -2385,7 +2388,7 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
                     conn.close()
                     return {"ok": True, "message": f"PostgreSQL 连接成功 — {host}:{port}/{database}，{len(tables)} 张表: {', '.join(row_info)}", "tables": tables}
             except Exception as e:
-                return {"ok": False, "message": f"RDS {engine} 连接失败: {str(e)[:200]}"}
+                return {"ok": False, "message": f"RDS {engine} 连接失败: {safe_message(e, 'api_datasource_test')}"}
         elif ds_type == "SQLite":
             try:
                 import sqlite3
@@ -2399,7 +2402,7 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
                 conn.close()
                 return {"ok": True, "message": f"连接成功 — SQLite {db_path}，{len(tables)} 张表: {', '.join(row_info)}"}
             except Exception as e:
-                return {"ok": False, "message": f"SQLite 连接失败: {str(e)[:100]}"}
+                return {"ok": False, "message": f"SQLite 连接失败: {safe_message(e, 'api_datasource_test')}"}
         elif ds_type == "Snowflake":
             account = config.get("account", "")
             user = config.get("user", "")
@@ -2426,7 +2429,7 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
             except ImportError:
                 return {"ok": False, "message": "Snowflake connector 未安装 (pip install snowflake-connector-python)"}
             except Exception as e:
-                return {"ok": False, "message": f"Snowflake 连接失败: {str(e)[:200]}"}
+                return {"ok": False, "message": f"Snowflake 连接失败: {safe_message(e, 'api_datasource_test')}"}
         elif ds_type == "Redshift":
             cluster = config.get("cluster", "")
             database = config.get("database", "dev")
@@ -2458,7 +2461,7 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
                 else:
                     return {"ok": False, "message": f"Redshift 查询失败: {status.get('Error', status['Status'])}"}
             except Exception as e:
-                return {"ok": False, "message": f"Redshift 连接失败: {str(e)[:200]}"}
+                return {"ok": False, "message": f"Redshift 连接失败: {safe_message(e, 'api_datasource_test')}"}
         elif ds_type == "OpenSearch":
             domain = config.get("domain", "")
             if not domain:
@@ -2473,11 +2476,11 @@ def api_datasource_test(req: dict, _admin: dict = Depends(require_admin)):
                 names = [idx["index"] for idx in indices if not idx["index"].startswith(".")]
                 return {"ok": True, "message": f"连接成功 — {len(names)} 个索引", "indices": names[:20]}
             except Exception as e:
-                return {"ok": False, "message": f"OpenSearch 连接失败: {str(e)[:200]}"}
+                return {"ok": False, "message": f"OpenSearch 连接失败: {safe_message(e, 'api_datasource_test')}"}
         else:
             return {"ok": False, "message": f"不支持的数据源类型: {ds_type}"}
     except Exception as e:
-        return {"ok": False, "message": f"连接失败: {str(e)}"}
+        return {"ok": False, "message": f"连接失败: {safe_message(e, 'api_datasource_test')}"}
 
 @app.put("/api/datasources/{ds_id}")
 def api_update_datasource(ds_id: str, req: dict, _admin: dict = Depends(require_admin)):
@@ -2775,7 +2778,7 @@ def api_ds_preview_semantic(ds_id: str):
         }
     except Exception as e:
         print(f"Preview semantic for {ds_id} failed: {e}")
-        return {"ok": False, "message": str(e)}
+        return {"ok": False, "message": safe_message(e, "api_ds_preview_semantic")}
 
 
 @app.post("/api/datasources/{ds_id}/apply-semantic")
@@ -2991,7 +2994,7 @@ def api_tableau_connect(req: dict):
             tc._client = client
         return test
     except Exception as e:
-        return {"ok": False, "message": str(e)}
+        return {"ok": False, "message": safe_message(e, "api_tableau_connect")}
 
 
 # ═══════ SQL Engine Management ═══════
@@ -3084,7 +3087,7 @@ def api_add_snowflake(req: dict):
         multi.register("snowflake", sf, is_default=make_default)
         return {"ok": True, "message": test["message"], "details": test["details"]}
     except Exception as e:
-        return {"ok": False, "message": str(e)}
+        return {"ok": False, "message": safe_message(e, "api_add_snowflake")}
 
 # ═══════ External MCP Server Management ═══════
 
@@ -3218,11 +3221,11 @@ def api_test_mcp(req: dict, _admin: dict = Depends(require_admin)):
         elapsed = round((_time.time() - start) * 1000)
         return JSONResponse({"status": "error", "latency_ms": elapsed, "message": f"HTTP {e.code}"}, 200)
     except urllib.error.URLError as e:
-        return JSONResponse({"status": "error", "message": f"连接失败: {str(e.reason)[:100]}"}, 200)
+        return JSONResponse({"status": "error", "message": f"连接失败: {safe_message(e, 'api_test_mcp')}"}, 200)
     except FileNotFoundError:
         return JSONResponse({"status": "error", "message": f"命令不存在: {command}"}, 200)
     except Exception as e:
-        return JSONResponse({"status": "error", "message": f"错误: {str(e)[:150]}"}, 200)
+        return JSONResponse({"status": "error", "message": f"错误: {safe_message(e, 'api_test_mcp')}"}, 200)
 
 @app.post("/api/mcp/tools")
 def api_list_mcp_tools(req: dict, _admin: dict = Depends(require_admin)):
@@ -3239,7 +3242,7 @@ def api_list_mcp_tools(req: dict, _admin: dict = Depends(require_admin)):
         tools = data.get("tools", data) if isinstance(data, dict) else data
         return {"status": "ok", "tools": tools}
     except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)[:200]}, 200)
+        return JSONResponse({"status": "error", "message": safe_message(e, "api_list_mcp_tools")}, 200)
 
 # ═══════ Semantic Layer ═══════
 
@@ -3737,7 +3740,7 @@ def api_feedback(req: dict, request: Request):
         
         return {"status": "ok"}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": safe_message(e, "api_feedback")}
 
 @app.get("/api/feedback/stats")
 def api_feedback_stats(request: Request):
@@ -3751,7 +3754,7 @@ def api_feedback_stats(request: Request):
         down = sum(1 for i in items if i.get("rating") == "down")
         return {"total": len(items), "up": up, "down": down, "rate": round(up/(up+down)*100,1) if up+down>0 else 0, "recent": sorted(items, key=lambda x: x.get("timestamp",""), reverse=True)[:20]}
     except Exception as e:
-        return {"total": 0, "up": 0, "down": 0, "error": str(e)}
+        return {"total": 0, "up": 0, "down": 0, "error": safe_message(e, "api_feedback_stats")}
 
 
 # ───────────────── VQR (Verified Query Repository) API ─────────────────
@@ -3763,7 +3766,7 @@ def api_vqr_stats(request: Request):
         from agentic_core.vqr import get_stats
         return get_stats()
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_stats")}
 
 @app.get("/api/vqr/verified")
 def api_vqr_verified(request: Request):
@@ -3774,7 +3777,7 @@ def api_vqr_verified(request: Request):
         from agentic_core.vqr import get_verified_queries
         return {"queries": get_verified_queries()}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_verified")}
 
 @app.get("/api/vqr/candidates")
 def api_vqr_candidates(request: Request, status: str = "pending"):
@@ -3785,7 +3788,7 @@ def api_vqr_candidates(request: Request, status: str = "pending"):
         from agentic_core.vqr import get_candidates
         return {"candidates": get_candidates(status=status)}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_candidates")}
 
 @app.post("/api/vqr/verify/{candidate_id}")
 def api_vqr_verify(candidate_id: str, req: dict, request: Request):
@@ -3815,7 +3818,7 @@ def api_vqr_verify(candidate_id: str, req: dict, request: Request):
         )
         return {"status": "ok", "vqr_id": vq_id} if vq_id else {"error": "候选不存在"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_verify")}
 
 @app.post("/api/vqr/reject/{candidate_id}")
 def api_vqr_reject(candidate_id: str, req: dict, request: Request):
@@ -3827,7 +3830,7 @@ def api_vqr_reject(candidate_id: str, req: dict, request: Request):
         reject_candidate(candidate_id, reason=req.get("reason", ""))
         return {"status": "ok"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_reject")}
 
 @app.post("/api/vqr/add")
 def api_vqr_add(req: dict, request: Request):
@@ -3847,7 +3850,7 @@ def api_vqr_add(req: dict, request: Request):
         )
         return {"status": "ok", "vqr_id": vq_id}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_add")}
 
 @app.put("/api/vqr/{vqr_id}")
 def api_vqr_update(vqr_id: str, req: dict, request: Request):
@@ -3859,7 +3862,7 @@ def api_vqr_update(vqr_id: str, req: dict, request: Request):
         ok = update_verified_query(vqr_id, req)
         return {"status": "ok"} if ok else {"error": "VQR 不存在"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_update")}
 
 @app.delete("/api/vqr/{vqr_id}")
 def api_vqr_delete(vqr_id: str, request: Request):
@@ -3871,7 +3874,7 @@ def api_vqr_delete(vqr_id: str, request: Request):
         ok = delete_verified_query(vqr_id)
         return {"status": "ok"} if ok else {"error": "VQR 不存在"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_delete")}
 
 @app.post("/api/vqr/judge/{candidate_id}")
 def api_vqr_judge(candidate_id: str, request: Request):
@@ -3891,7 +3894,7 @@ def api_vqr_judge(candidate_id: str, request: Request):
         _save_candidates(candidates)
         return {"status": "ok", "judge": judge_result}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_vqr_judge")}
 
 # ───────────────── Auth & User Management API ─────────────────
 
@@ -4034,12 +4037,12 @@ def api_auth_callback(body: dict):
             }
         }
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if e.fp else str(e)
+        error_body = safe_message(e, "api_auth_callback")
         logger.error(f"Token exchange failed: {error_body}")
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {error_body}")
     except Exception as e:
         logger.error(f"Token exchange error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_message(e, "api_auth_callback"))
 
 @app.post("/api/auth/refresh")
 def api_refresh(request: Request):
@@ -4192,7 +4195,7 @@ def api_list_dashboards(request: Request):
         clean = _json.loads(_json.dumps({"dashboards": dashboards}, default=_dec_default))
         return clean
     except Exception as e:
-        return {"dashboards": [], "error": str(e)}
+        return {"dashboards": [], "error": safe_message(e, "_dec_default")}
 
 @app.post("/api/user/dashboards")
 def api_save_dashboard(request: Request, body: dict):
@@ -4212,7 +4215,7 @@ def api_save_dashboard(request: Request, body: dict):
         })
         return {"ok": True, "id": db_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_message(e, "api_save_dashboard"))
 
 @app.delete("/api/user/dashboards/{dashboard_id:path}")
 def api_delete_dashboard(dashboard_id: str, request: Request):
@@ -4225,7 +4228,7 @@ def api_delete_dashboard(dashboard_id: str, request: Request):
         _ddb.Table(CONFIG_TABLE).delete_item(Key={"config_key": dashboard_id})
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_message(e, "api_delete_dashboard"))
 
 @app.get("/api/admin/memories")
 def api_admin_memories(request: Request):
@@ -4243,7 +4246,7 @@ def api_admin_memories(request: Request):
             memories[email] = item.get("data", {})
         return {"memories": memories}
     except Exception as e:
-        return {"memories": {}, "error": str(e)}
+        return {"memories": {}, "error": safe_message(e, "api_admin_memories")}
 
 
 # ─── Data Upload + Auto Schema Inference ─────────────────────
@@ -4341,7 +4344,7 @@ def api_apply_upload(req: dict):
             ContentType="application/json"
         )
     except Exception as e:
-        return JSONResponse({"error": f"S3 上传失败: {e}"}, 500)
+        return JSONResponse({"error": f"S3 上传失败: {safe_message(e, 'api_apply_upload')}"}, 500)
     
     # 2. Register as ChatBI dataset
     from agentic_core.tools import CHATBI_DATASETS; _chatbi_cache = {}
@@ -4529,7 +4532,7 @@ def api_connect_datasource(req: dict, _admin: dict = Depends(require_admin)):
                 conn.close()
                 return {"ok": True, "message": f"连接成功 — SQLite {db_path}，{len(tables)} 张表: {', '.join(row_info)}"}
             except Exception as e:
-                return {"ok": False, "message": f"SQLite 连接失败: {str(e)[:100]}"}
+                return {"ok": False, "message": f"SQLite 连接失败: {safe_message(e, 'api_connect_datasource')}"}
         elif ds_type == "Snowflake":
             from agentic_core.db_engine import SnowflakeEngine
             eng = SnowflakeEngine(
@@ -4611,7 +4614,7 @@ def api_connect_datasource(req: dict, _admin: dict = Depends(require_admin)):
                     schema_label = pg_schema if pg_schema else ', '.join(schemas_to_scan)
                     test_msg = f"PostgreSQL {host}:{port}/{database} (schema: {schema_label}) — {len(introspection)} 张表, {total_rows:,} 行"
             except Exception as e:
-                return {"ok": False, "message": f"RDS {engine} 连接失败: {str(e)[:200]}"}
+                return {"ok": False, "message": f"RDS {engine} 连接失败: {safe_message(e, 'api_connect_datasource')}"}
             
         elif ds_type == "Tableau":
             from agentic_core.tableau_client import get_tableau_client
@@ -4624,7 +4627,7 @@ def api_connect_datasource(req: dict, _admin: dict = Depends(require_admin)):
             return {"ok": False, "message": f"不支持的数据源类型: {ds_type}"}
         
     except Exception as e:
-        return {"ok": False, "message": f"连接失败: {str(e)}"}
+        return {"ok": False, "message": f"连接失败: {safe_message(e, 'api_connect_datasource')}"}
     
     # Calculate total metrics/dimensions across all datasets
     total_metrics = sum(len(r.get("metrics", {})) for r in introspection)
@@ -5463,7 +5466,7 @@ def api_test_recommendation(req: dict):
             "question": question,
             "response": "",
             "passed": False,
-            "error": str(e)[:500],
+            "error": safe_message(e, "api_test_recommendation"),
         }
     finally:
         _agents.pop(session_id, None)
@@ -5491,7 +5494,7 @@ def api_agent_logs(limit: int = 50):
             })
         return {"logs": logs, "count": len(logs)}
     except Exception as e:
-        return {"logs": [], "error": str(e)[:200]}
+        return {"logs": [], "error": safe_message(e, "api_agent_logs")}
 
 
 # ═══════ Agent Health Dashboard ═══════
@@ -5960,7 +5963,7 @@ async def api_run_scheduled_report(schedule_id: str, request: Request):
 
             event_queue.put(("done", history_entry))
         except Exception as e:
-            event_queue.put(("error", str(e)))
+            event_queue.put(("error", safe_message(e, "run_agent")))
 
     threading.Thread(target=run_agent, daemon=True).start()
 
@@ -6077,7 +6080,7 @@ def api_playground_run(req: dict):
         result = agent(question)
         answer = str(result)
     except Exception as e:
-        answer = f"Agent 执行失败: {str(e)[:300]}"
+        answer = f"Agent 执行失败: {safe_message(e, 'on_after')}"
 
     latency_ms = int((_t.time() - start) * 1000)
 
@@ -6290,7 +6293,7 @@ def api_run_test_cases(agent_id: str, req: dict = {}):
                 "case_id": case["id"],
                 "question": case["question"],
                 "passed": False,
-                "error": str(e)[:200],
+                "error": safe_message(e, "api_run_test_cases"),
             })
 
     passed = sum(1 for r in results if r.get("passed"))
@@ -6743,7 +6746,7 @@ def api_agent_metrics(days: int = 7):
             resp = _ddb.Table(COST_TABLE).scan(ExclusiveStartKey=resp["LastEvaluatedKey"], Limit=500)
             items.extend(resp.get("Items", []))
     except Exception as e:
-        return {"error": str(e)[:200]}
+        return {"error": safe_message(e, "api_agent_metrics")}
 
     # Parse
     records = []
@@ -6903,7 +6906,7 @@ def api_list_traces(limit: int = 20, date: str = ""):
                 })
         return {"traces": traces[:limit]}
     except Exception as e:
-        return {"traces": [], "error": str(e)[:200]}
+        return {"traces": [], "error": safe_message(e, "api_list_traces")}
 
 @app.get("/api/traces/{trace_id}")
 def api_get_trace(trace_id: str):
@@ -7053,4 +7056,4 @@ def api_tool_docstring(tool_name: str):
         text = builder()
         return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": safe_message(e, "api_tool_docstring")}

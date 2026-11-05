@@ -404,3 +404,78 @@ is caught. It synthesises three times: the default, `publicly_accessible=true`
 with no certificate (which must refuse to synthesise), and with a certificate
 (which must produce HTTPS plus a redirect). It skips rather than passes if
 `cdk/node_modules` is absent.
+
+## Fixed in v1.0.4 — exception text was returned to callers
+
+CodeQL reported 66 `py/stack-trace-exposure` findings, all in `api/main.py`.
+Medium severity, and not part of the original report — fixed because the text
+being returned was worse than the rule implies.
+
+### What was wrong
+
+Handlers returned `str(e)` straight to the client:
+
+```python
+return {"ok": False, "message": f"PostgreSQL 连接失败: {str(e)[:200]}"}
+```
+
+A driver puts its own choice of detail in that message. For a rejected
+PostgreSQL login it is:
+
+```
+connection to server at 10.0.3.14, port 5432 failed: FATAL:
+password authentication failed for user "svc_reporting"
+```
+
+So the response disclosed an internal address, a port, and a service account
+name. Elsewhere the same pattern returned absolute filesystem paths, SQL text
+with table and column names, and — in `/api/auth/callback` — the identity
+provider's own error body, forwarded verbatim.
+
+### What changed
+
+`agentic_core/errors.py` is now the only place an exception becomes something a
+caller sees. It logs the exception in full, under a short reference, and returns
+a category plus that reference:
+
+```
+认证失败或权限不足(参考 4e000283327e)
+```
+
+The useful part of the old message was the *kind* of failure, not the detail: a
+caller debugging a data source needs to know the credentials were rejected, not
+which user the driver tried. Eleven categories cover it — timeout, auth, dns,
+network, blocked, notfound, invalid, readonly, unsupported, conflict, internal —
+chosen from the exception's type first and its message only as a fallback.
+
+**The implementation detail that makes this a fix rather than a narrower leak:**
+`safe_message` reads the exception only to pick a branch and to write the log
+line. Every string it returns is a literal plus a random reference. Nothing the
+exception contains is concatenated into the result.
+
+Rewritten: 59 sites in `api/main.py` and 58 across eleven `agentic_core` modules,
+117 in total. The 42 `print()` and `logger` calls that log exception text
+server-side were left alone — that is where it belongs.
+
+Also removed from the global exception handler: `"type": type(exc).__name__`,
+which named the internal exception class on every unhandled error.
+
+### Verifying
+
+`tests/test_hardening_regression.py` grew to 28 checks. Three are about this:
+
+- A simulated PostgreSQL authentication failure, asserting that none of the
+  host, port, user, or driver phrasing survives into the returned message.
+- The classifier, across eight exception kinds.
+- **A structural check over `api/main.py` and every module in `agentic_core`**:
+  no `str(e)` is reachable from a `return`, a `raise HTTPException`, or an
+  assignment to an error field. Asserted with `ast` rather than grep, because the
+  distinction that matters is `str(e)` in a response versus `str(e)` in a log
+  line, and only the first is a defect.
+
+### Note on the reference
+
+The reference in an error message is the only part worth copying out of a UI
+toast: it is what ties a user's report to the log line holding the real cause.
+Searching CloudWatch for `err:<reference>` returns the exception and its
+traceback.

@@ -12,6 +12,9 @@ Usage:
 import os, json, logging, sqlite3, re
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
+# Exception text is logged, never returned: these dicts and strings reach the
+# API's responses, and str(e) carries paths, SQL and sometimes credentials.
+from agentic_core.errors import safe_message
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +229,7 @@ class SQLiteEngine(SQLEngine):
             rows = [dict(r) for r in cur.fetchmany(max_rows)]
             return {"columns": cols, "rows": rows, "count": len(rows)}
         except Exception as e:
-            return {"error": str(e), "sql": sql}
+            return {"error": safe_message(e, "execute"), "sql": sql}
         finally:
             conn.close()
 
@@ -254,7 +257,7 @@ class SQLiteEngine(SQLEngine):
             return {"ok": True, "message": f"SQLite OK — {len(tables)} tables",
                     "details": {"path": self.db_path, "tables": [t[0] for t in tables]}}
         except Exception as e:
-            return {"ok": False, "message": str(e), "details": {}}
+            return {"ok": False, "message": safe_message(e, "test_connection"), "details": {}}
 
 
 # ═══════ Snowflake ═══════
@@ -337,7 +340,7 @@ class SnowflakeEngine(SQLEngine):
             return {"columns": cols, "rows": rows, "count": len(rows)}
         except Exception as e:
             logger.error(f"Snowflake SQL error: {e}")
-            return {"error": str(e), "sql": sql}
+            return {"error": safe_message(e, "execute"), "sql": sql}
 
     def get_schema(self):
         try:
@@ -363,7 +366,7 @@ class SnowflakeEngine(SQLEngine):
             return tables
         except Exception as e:
             logger.error(f"Snowflake schema error: {e}")
-            return {"_error": str(e)}
+            return {"_error": safe_message(e, "get_schema")}
 
     def test_connection(self):
         try:
@@ -380,7 +383,7 @@ class SnowflakeEngine(SQLEngine):
                     "details": {"version": row[0], "account": row[1], "database": row[2],
                                 "schema": row[3], "warehouse": row[4], "table_count": tc}}
         except Exception as e:
-            return {"ok": False, "message": str(e), "details": {}}
+            return {"ok": False, "message": safe_message(e, "test_connection"), "details": {}}
 
     def get_source_label(self):
         return f"Snowflake ({self.database}.{self.schema})"
@@ -428,7 +431,7 @@ class PostgreSQLEngine(SQLEngine):
             cur.close()
             return {"columns": cols, "rows": rows, "count": len(rows)}
         except Exception as e:
-            return {"error": str(e), "sql": sql}
+            return {"error": safe_message(e, "execute"), "sql": sql}
 
     def get_schema(self):
         try:
@@ -445,7 +448,7 @@ class PostgreSQLEngine(SQLEngine):
             cur.close()
             return tables
         except Exception as e:
-            return {"_error": str(e)}
+            return {"_error": safe_message(e, "get_schema")}
 
     def test_connection(self):
         try:
@@ -456,7 +459,7 @@ class PostgreSQLEngine(SQLEngine):
             cur.close()
             return {"ok": True, "message": f"PostgreSQL OK", "details": {"version": ver, "host": self.host}}
         except Exception as e:
-            return {"ok": False, "message": str(e), "details": {}}
+            return {"ok": False, "message": safe_message(e, "test_connection"), "details": {}}
 
 
 # ═══════ MultiEngine Manager ═══════
@@ -505,7 +508,7 @@ class MySQLEngine(SQLEngine):
                     conn.commit()
             return {"columns": cols, "rows": rows, "count": len(rows)}
         except Exception as e:
-            return {"error": str(e), "sql": sql}
+            return {"error": safe_message(e, "execute"), "sql": sql}
 
     def get_schema(self):
         try:
@@ -522,7 +525,7 @@ class MySQLEngine(SQLEngine):
                     tables[tname] = {"columns": columns, "record_count": count, "sample": []}
             return tables
         except Exception as e:
-            return {"_error": str(e)}
+            return {"_error": safe_message(e, "get_schema")}
 
     def test_connection(self):
         try:
@@ -532,7 +535,7 @@ class MySQLEngine(SQLEngine):
                 ver = cur.fetchone()['VERSION()']
             return {"ok": True, "message": "MySQL OK", "details": {"version": ver, "host": self.host}}
         except Exception as e:
-            return {"ok": False, "message": str(e), "details": {}}
+            return {"ok": False, "message": safe_message(e, "test_connection"), "details": {}}
 
 
 class MultiEngine:
@@ -563,7 +566,7 @@ class MultiEngine:
                 for tname, tinfo in eng.get_schema().items():
                     result[f"{key}.{tname}"] = {**tinfo, "engine": key, "engine_name": eng.name}
             except Exception as e:
-                result[f"{key}._error"] = {"error": str(e)}
+                result[f"{key}._error"] = {"error": safe_message(e, "get_all_schemas")}
         return result
 
     def test_all(self):

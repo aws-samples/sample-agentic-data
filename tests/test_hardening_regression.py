@@ -56,6 +56,36 @@ def _source(path):
         return fh.read()
 
 
+def _install_light_agentic_core():
+    """Register a stand-in `agentic_core` package in sys.modules.
+
+    The modules below are loaded by path so the suite does not need the agent
+    runtime installed. They now import `agentic_core.errors`, and resolving that
+    normally would execute the real `agentic_core/__init__.py`, which imports
+    strands and the whole agent stack. `errors` itself depends on nothing but
+    logging and uuid, so it is loaded directly and attached to a package object
+    that has a __path__ and no __init__ side effects.
+    """
+    import types
+    existing = sys.modules.get("agentic_core")
+    if existing is not None and getattr(existing, "__test_stub__", False):
+        return
+    pkg = types.ModuleType("agentic_core")
+    pkg.__path__ = [os.path.join(ROOT, "agentic_core")]
+    pkg.__test_stub__ = True
+    sys.modules["agentic_core"] = pkg
+    spec = importlib.util.spec_from_file_location(
+        "agentic_core.errors", os.path.join(ROOT, "agentic_core", "errors.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agentic_core.errors"] = module
+    spec.loader.exec_module(module)
+    pkg.errors = module
+
+
+_install_light_agentic_core()
+
+
 # ───────────────────────── the import break ─────────────────────────
 
 @check("every name api/main.py imports from auth exists in auth.py")
@@ -478,6 +508,101 @@ def _():
                 raise AssertionError("an empty path was accepted")
         finally:
             os.environ.pop("AGENTIC_AUTO_KEY_DIR", None)
+
+
+# ──────────── CWE-209: exception text in responses ────────────
+
+ERRORS = _load("agentic_core/errors.py", "agentic_core_errors_t")
+
+
+@check("a returned error message carries no text from the exception")
+def _():
+    # The message a PostgreSQL driver raises on a rejected login includes the
+    # host, the port and the user it tried. That used to be handed to the caller.
+    leaky = Exception(
+        'connection to server at 10.0.3.14, port 5432 failed: FATAL: password '
+        'authentication failed for user "svc_reporting"'
+    )
+    message = ERRORS.safe_message(leaky, "unit test")
+    for fragment in ("10.0.3.14", "5432", "svc_reporting", "password authentication",
+                     "FATAL", "connection to server"):
+        assert fragment not in message, f"leaked {fragment!r}: {message}"
+    assert ERRORS.classify(leaky) == "auth", ERRORS.classify(leaky)
+    # Shape: a category label and a reference, nothing else.
+    import re as _re
+    assert _re.fullmatch(r"[^()]+\(参考 [0-9a-f]{12}\)", message), message
+
+
+@check("failures are classified into a category the caller can act on")
+def _():
+    import socket
+    cases = [
+        (TimeoutError("timed out"), "timeout"),
+        (socket.gaierror("nodename nor servname provided"), "dns"),
+        (ConnectionRefusedError("[Errno 61] Connection refused"), "network"),
+        (PermissionError("denied"), "auth"),
+        (FileNotFoundError("/etc/pki/secret.pem"), "notfound"),
+        (ValueError("Only SELECT and WITH statements may be executed, not DROP"), "readonly"),
+        (ValueError("bad input"), "invalid"),
+        (Exception("something nobody has ever seen"), "internal"),
+    ]
+    for exc, expected in cases:
+        got = ERRORS.classify(exc)
+        assert got == expected, f"{type(exc).__name__}: got {got}, expected {expected}"
+    # A path in the message must not survive into the output either.
+    assert "/etc/pki/secret.pem" not in ERRORS.safe_message(cases[4][0], "t")
+
+
+@check("no response anywhere passes exception text to the caller")
+def _():
+    # Checked structurally rather than by grep: the pattern that matters is
+    # str(e) reachable from a `return`, a JSONResponse, or an HTTPException
+    # detail -- not str(e) in a log line, which is where it belongs.
+    offenders = []
+    for path in ["api/main.py"] + sorted(
+        os.path.join("agentic_core", f)
+        for f in os.listdir(os.path.join(ROOT, "agentic_core"))
+        if f.endswith(".py")
+    ):
+        tree = ast.parse(_source(path))
+
+        def leaks(node):
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                if isinstance(inner.func, ast.Name) and inner.func.id == "str":
+                    if inner.args and isinstance(inner.args[0], ast.Name) \
+                            and inner.args[0].id in ("e", "exc", "_e", "err"):
+                        return True
+            return False
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Return) and node.value is not None and leaks(node.value):
+                offenders.append(f"{path}:{node.lineno} return")
+            elif isinstance(node, ast.Raise) and node.exc is not None and leaks(node.exc):
+                offenders.append(f"{path}:{node.lineno} raise")
+            elif isinstance(node, ast.Assign) and leaks(node.value):
+                # An assignment is only a problem if the target is an error field
+                # that gets returned; flag the shapes that were the actual bugs.
+                target = ast.unparse(node.targets[0]) if node.targets else ""
+                if any(k in target for k in ('["error"]', "['error']", "error_body",
+                                             'err_msg', '["message"]', "['message']")):
+                    offenders.append(f"{path}:{node.lineno} {target}")
+    assert not offenders, "exception text reaches a response at: " + ", ".join(offenders[:12])
+
+
+@check("errors.py depends on nothing that could make its import circular")
+def _():
+    tree = ast.parse(_source("agentic_core/errors.py"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add((node.module or "").split(".")[0])
+    # Every module in the package imports this one, so it must import none of them.
+    assert "agentic_core" not in imported, imported
+    assert imported <= {"logging", "uuid", "__future__"}, imported
 
 
 print()
