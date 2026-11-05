@@ -6,7 +6,7 @@
 
 > ## ⚠️ Security Notice
 >
-> **Do not deploy any version earlier than `v1.0.2`. Earlier versions contain
+> **Do not deploy any version earlier than `v1.0.3`. Earlier versions contain
 > several Critical defects.**
 >
 > Authentication defaulted to off (`AGENTIC_AUTO_AUTH_ENABLED` defaulted to `false`)
@@ -18,7 +18,7 @@
 > Reported by an external researcher through the AWS Vulnerability Reporting Program.
 > CVSS 3.1 score **9.8 (Critical)**, CWE-306 / CWE-1188.
 >
-> `v1.0.2` additionally fixes: `POST /api/mcp/test` executed a command named in the
+> `v1.0.3` additionally fixes: `POST /api/mcp/test` executed a command named in the
 > request body, which is arbitrary command execution as the task role; six endpoints
 > fetched a URL named in the request body and returned the response, which on Fargate
 > reads the task role's credentials from `169.254.170.2`; and the `authing`
@@ -26,11 +26,20 @@
 >
 > **If you have already deployed an earlier version:**
 > 1. Restrict ingress to the load balancer immediately, or make it internal.
-> 2. Upgrade to `v1.0.2` or later and supply `AllowedCIDRs` and `JwtSigningSecret`
+> 2. Upgrade to `v1.0.3` or later and supply `AllowedCIDRs` and `JwtSigningSecret`
 >    explicitly at deploy time.
 > 3. Review load balancer and application logs for unauthorised access.
 > 4. Rotate every credential that deployment held — the task role, data-source
 >    passwords and model API keys.
+>
+> **If you deployed `v1.0.1` or `v1.0.2`, there is one more step.** Those versions
+> wrote the JWT signing secret into the ECS task definition in plaintext — `noEcho`
+> on the parameter does not prevent this — so anyone with
+> `ecs:DescribeTaskDefinition` could read it and forge a token for any user, and
+> task definition revisions are retained. Rotate `JwtSigningSecret` and deregister
+> the old task definition revisions. Those versions also turned authentication on
+> while the init Lambda wrote the admin password in a format the application does
+> not verify, so **login did not work at all**. `v1.0.3` fixes both.
 >
 > See [SECURITY.md](SECURITY.md) for what changed. Report issues to
 > aws-security@amazon.com.

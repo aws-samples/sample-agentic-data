@@ -1,4 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
+import { Validations } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecs_patterns from 'aws-cdk-lib/aws-ecs-patterns';
@@ -7,6 +8,7 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import * as path from 'path';
@@ -56,6 +58,28 @@ export class AgenticDataStack extends cdk.Stack {
         'Generate with: openssl rand -base64 48',
     });
 
+    // Both parameters above are declared noEcho, but noEcho only hides a value
+    // from CloudFormation's own parameter display. Referencing one from a task
+    // definition's `environment` or a Lambda's `environment` writes the resolved
+    // plaintext into that resource, where anyone holding
+    // ecs:DescribeTaskDefinition or lambda:GetFunctionConfiguration can read it
+    // -- and task definition revisions are retained, so the value outlives a
+    // rotation. For the signing secret that is a full authentication bypass:
+    // whoever reads it can mint valid tokens.
+    //
+    // So the values land in Secrets Manager and the consumers reference them by
+    // ARN. The template carries only { Ref }, which CloudFormation resolves into
+    // the secret, not into the task definition.
+    const jwtSecretStore = new secretsmanager.Secret(this, 'JwtSigningSecretStore', {
+      description: 'Signing secret for local-auth JWTs',
+      secretStringValue: cdk.SecretValue.unsafePlainText(jwtSecret.valueAsString),
+    });
+
+    const adminPasswordStore = new secretsmanager.Secret(this, 'AdminPasswordStore', {
+      description: 'Initial admin password for local auth',
+      secretStringValue: cdk.SecretValue.unsafePlainText(adminPassword.valueAsString),
+    });
+
     // Model config is OPTIONAL at deploy time — can be configured later via Admin UI
     const modelProvider = this.node.tryGetContext('model_provider') || (isChina ? 'openai' : 'bedrock');
     const modelId = this.node.tryGetContext('model_id') || (isChina ? '' : 'us.anthropic.claude-sonnet-4-6');
@@ -86,6 +110,22 @@ export class AgenticDataStack extends cdk.Stack {
             { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
             { name: 'Private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 },
           ],
+          // The response to this content's report asked for the deployment's
+          // logs to be reviewed for unauthorised access. Without flow logs
+          // there is nothing at the network layer to review.
+          flowLogs: {
+            // Not "Default": that becomes a child construct named Default, which
+            // collides with CDK's own defaultChild lookup on the VPC.
+            All: {
+              destination: ec2.FlowLogDestination.toCloudWatchLogs(
+                new logs.LogGroup(this, 'VpcFlowLogs', {
+                  retention: logs.RetentionDays.THREE_MONTHS,
+                  removalPolicy: cdk.RemovalPolicy.DESTROY,
+                })
+              ),
+              trafficType: ec2.FlowLogTrafficType.ALL,
+            },
+          },
         });
 
     // ALB Security Group — NEVER 0.0.0.0/0
@@ -98,7 +138,7 @@ export class AgenticDataStack extends cdk.Stack {
     // Use a Lambda-backed CustomResource to dynamically add SG ingress rules
     // This avoids the Fn::Select index-out-of-bounds issue with variable-length CIDR lists
     const sgRuleFn = new lambda.Function(this, 'SgRuleFn', {
-      runtime: lambda.Runtime.PYTHON_3_12,
+      runtime: lambda.Runtime.PYTHON_3_14,
       handler: 'index.handler',
       code: lambda.Code.fromInline(`
 import json, boto3, urllib.request
@@ -181,13 +221,21 @@ def send_response(url, event, status, reason=''):
 `),
       timeout: cdk.Duration.seconds(60),
     });
+    // Split in two. The mutating actions are scoped to the one security group
+    // this function exists to manage -- on `*` it could rewrite the ingress rules
+    // of every security group in the account, including ones belonging to
+    // unrelated workloads.
     sgRuleFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: [
-        'ec2:AuthorizeSecurityGroupIngress',
-        'ec2:RevokeSecurityGroupIngress',
-        'ec2:DescribeSecurityGroups',
-        'ec2:DescribeManagedPrefixLists',
+      actions: ['ec2:AuthorizeSecurityGroupIngress', 'ec2:RevokeSecurityGroupIngress'],
+      resources: [
+        `arn:${arnPartition}:ec2:${this.region}:${this.account}:security-group/${albSg.securityGroupId}`,
       ],
+    }));
+
+    // These two do not support resource-level permissions, so `*` is the only
+    // form AWS accepts. Both are read-only.
+    sgRuleFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['ec2:DescribeSecurityGroups', 'ec2:DescribeManagedPrefixLists'],
       resources: ['*'],
     }));
 
@@ -221,6 +269,7 @@ def send_response(url, event, status, reason=''):
       partitionKey: { name: 'config_key', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
     const chatTable = new dynamodb.Table(this, 'ChatTable', {
@@ -229,6 +278,7 @@ def send_response(url, event, status, reason=''):
       sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       timeToLiveAttribute: 'ttl',
     });
 
@@ -238,6 +288,7 @@ def send_response(url, event, status, reason=''):
       sortKey: { name: 'id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
     const eventsTable = new dynamodb.Table(this, 'EventsTable', {
@@ -246,6 +297,7 @@ def send_response(url, event, status, reason=''):
       sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
     const feedbackTable = new dynamodb.Table(this, 'FeedbackTable', {
@@ -254,13 +306,31 @@ def send_response(url, event, status, reason=''):
       sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
     // ═══════ Storage: S3 ═══════
+    // Destination for the data bucket's server access logs and the load
+    // balancer's access logs. Separate from the data bucket on purpose: a bucket
+    // cannot usefully log to itself, and mixing audit records in with application
+    // data means the same grants cover both.
+    const logBucket = new s3.Bucket(this, 'LogBucket', {
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      lifecycleRules: [{ expiration: cdk.Duration.days(365) }],
+    });
+
     const dataBucket = new s3.Bucket(this, 'DataBucket', {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
+      // Without this the bucket policy permits plaintext HTTP, so the
+      // encryption setting above only covers data at rest.
+      enforceSSL: true,
+      serverAccessLogsBucket: logBucket,
+      serverAccessLogsPrefix: 'data-bucket/',
     });
 
     // ═══════ IAM: Task Role ═══════
@@ -309,7 +379,22 @@ def send_response(url, event, status, reason=''):
         'glue:GetDatabase',
         'glue:GetDatabases',
       ],
-      resources: ['*'],
+      // Still a wildcard, because which database a user queries is chosen after
+      // deployment, but confined to this account and region. On `*` these actions
+      // reach every Athena workgroup and Glue catalog the credentials can see.
+      // Account and region are left as wildcards deliberately: a cdk-nag
+      // acknowledgement has to quote the resource string exactly and cannot use a
+      // pattern, so embedding this.account would produce an acknowledgement that
+      // only matches the account it was synthesised in. These actions are still
+      // confined to Athena workgroups and Glue catalog objects, and the task role
+      // cannot reach another account's Glue or Athena without that account's own
+      // resource policy.
+      resources: [
+        `arn:${arnPartition}:athena:*:*:workgroup/*`,
+        `arn:${arnPartition}:glue:*:*:catalog`,
+        `arn:${arnPartition}:glue:*:*:database/*`,
+        `arn:${arnPartition}:glue:*:*:table/*/*`,
+      ],
     }));
 
     // SSM for ECS Exec
@@ -321,6 +406,7 @@ def send_response(url, event, status, reason=''):
     // ═══════ ECS Fargate ═══════
     const cluster = new ecs.Cluster(this, 'Cluster', {
       vpc,
+      containerInsightsV2: ecs.ContainerInsights.ENABLED,
     });
 
     const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', {
@@ -372,7 +458,6 @@ def send_response(url, event, status, reason=''):
       // library default is what produced the original defect: the stack set
       // AUTH_PROVIDER and nothing set AUTH_ENABLED, so every deployment ran open.
       AGENTIC_AUTO_AUTH_ENABLED: 'true',
-      AGENTIC_AUTO_JWT_SECRET: jwtSecret.valueAsString,
       AUTH_PROVIDER: authProvider,
       MODEL_PROVIDER: modelProvider,
       DEFAULT_MODEL: modelId,
@@ -412,6 +497,11 @@ def send_response(url, event, status, reason=''):
             platform: cdk.aws_ecr_assets.Platform.LINUX_ARM64,
           }),
       environment: envVars,
+      // Injected from Secrets Manager at container start. Never in `environment`:
+      // see the note on the parameters above.
+      secrets: {
+        AGENTIC_AUTO_JWT_SECRET: ecs.Secret.fromSecretsManager(jwtSecretStore),
+      },
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
         streamPrefix: 'app',
@@ -450,6 +540,10 @@ def send_response(url, event, status, reason=''):
       securityGroup: albSg,
     });
 
+    // The report's remediation advice was to review load balancer logs for
+    // unauthorised access. There were none to review.
+    alb.logAccessLogs(logBucket, 'alb/');
+
     const listener = certificateArn
       ? alb.addListener('Listener', {
           port: 443,
@@ -459,9 +553,22 @@ def send_response(url, event, status, reason=''):
         })
       : alb.addListener('Listener', {
           // Internal only, reached from inside the VPC via the CIDR allowlist.
+          // Plaintext here still carries session tokens in the clear across the
+          // VPC, so it is a trade-off rather than a safe default -- hence the
+          // warning below. Passing certificate_arn moves this to HTTPS even for
+          // an internal load balancer.
           port: 80,
           protocol: elbv2.ApplicationProtocol.HTTP,
         });
+
+    if (!certificateArn) {
+      cdk.Annotations.of(this).addWarning(
+        'The load balancer listener is plaintext HTTP. It is internal, so it is not ' +
+        'reachable from the internet, but bearer tokens still cross the VPC in the ' +
+        'clear. Pass -c certificate_arn=<acm-arn> to serve HTTPS instead; it works ' +
+        'for an internal load balancer too.'
+      );
+    }
 
     if (certificateArn) {
       // Redirect plaintext rather than serving it.
@@ -486,6 +593,9 @@ def send_response(url, event, status, reason=''):
       minHealthyPercent: 100,
       maxHealthyPercent: 200,
       enableExecuteCommand: true,
+      // Without this a task that cannot start takes up to three hours to fail
+      // the deployment instead of minutes.
+      circuitBreaker: { enable: true, rollback: true },
     });
 
     const targetGroup = listener.addTargets('AppTarget', {
@@ -509,13 +619,13 @@ def send_response(url, event, status, reason=''):
 
     // ═══════ Init Data: CustomResource Lambda ═══════
     const initFn = new lambda.Function(this, 'InitDataFn', {
-      runtime: lambda.Runtime.PYTHON_3_12,
+      runtime: lambda.Runtime.PYTHON_3_14,
       handler: 'index.handler',
       code: lambda.Code.fromInline(this.getInitLambdaCode()),
       timeout: cdk.Duration.seconds(60),
       environment: {
         CONFIG_TABLE: tableNames.config,
-        ADMIN_PASSWORD: adminPassword.valueAsString,
+        ADMIN_PASSWORD_SECRET_ARN: adminPasswordStore.secretArn,
         MODEL_PROVIDER: modelProvider,
         DEFAULT_MODEL: modelId,
         AUTH_PROVIDER: authProvider,
@@ -533,8 +643,9 @@ def send_response(url, event, status, reason=''):
       },
     });
     configTable.grantReadWriteData(initFn);
+    adminPasswordStore.grantRead(initFn);
 
-    new cr.Provider(this, 'InitProvider', {
+    const initProvider = new cr.Provider(this, 'InitProvider', {
       onEventHandler: initFn,
     });
 
@@ -546,12 +657,156 @@ def send_response(url, event, status, reason=''):
         },
       }),
       properties: {
-        // Force update on password or model change
-        adminPassword: adminPassword.valueAsString,
+        // The password used to be passed here to force an update when it
+        // changed. Custom resource properties are stored in the stack and handed
+        // to the Lambda in the event payload, so that published it twice over.
+        // `timestamp` already forces an update on every deploy, which is what
+        // the comment was actually after.
         modelProvider,
         timestamp: Date.now().toString(),
       },
     });
+
+    // ═══════ cdk_nag acknowledgements ═══════
+    //
+    // Every entry below is a finding this stack does not fix, with the reason it
+    // does not. Nothing here is blanket: cdk-nag v3 requires each finding to be
+    // named individually, including the exact action or resource it covers, so an
+    // acknowledgement cannot silently grow to cover a new finding. Anything that
+    // could be fixed was fixed instead -- VPC flow logs, S3 TLS enforcement and
+    // access logs, load balancer access logs, DynamoDB point-in-time recovery,
+    // Container Insights, the deployment circuit breaker, both Lambda runtimes,
+    // and the two IAM grants that were scoped down rather than excused.
+
+    const LAMBDA_LOGS_ACK =
+      'AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]';
+    const lambdaLogsReason =
+      'AWSLambdaBasicExecutionRole grants only CreateLogGroup, CreateLogStream and ' +
+      'PutLogEvents. A customer-managed copy would carry the same three permissions ' +
+      'under a different name, so replacing it narrows nothing and adds a policy to ' +
+      'maintain.';
+
+    for (const fn of [sgRuleFn, initFn]) {
+      Validations.of(fn).acknowledge({ id: LAMBDA_LOGS_ACK, reason: lambdaLogsReason });
+    }
+    Validations.of(initProvider).acknowledge({ id: LAMBDA_LOGS_ACK, reason: lambdaLogsReason });
+
+    Validations.of(initProvider).acknowledge({
+      id: 'AwsSolutions-IAM5[Resource::<InitDataFn93CE174C.Arn>:*]',
+      reason:
+        'Generated by the CDK custom-resource provider framework. The ":*" suffix ' +
+        'covers versions and aliases of a single function created by this stack.',
+    });
+
+    Validations.of(sgRuleFn).acknowledge({
+      id: 'AwsSolutions-IAM5[Resource::*]',
+      reason:
+        'ec2:DescribeSecurityGroups and ec2:DescribeManagedPrefixLists do not support ' +
+        'resource-level permissions, so AWS accepts no form other than "*". Both are ' +
+        'read-only. The two mutating actions this function needs, ' +
+        'AuthorizeSecurityGroupIngress and RevokeSecurityGroupIngress, sit in a ' +
+        'separate statement scoped to the one security group it manages -- on "*" it ' +
+        'could have rewritten the ingress rules of every security group in the account.',
+    });
+
+    Validations.of(taskRole).acknowledge({
+      id: 'AwsSolutions-IAM4[Policy::arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]',
+      reason:
+        'The policy ECS documents for enableExecuteCommand. Attaching it does not by ' +
+        'itself give anyone a shell: opening a session additionally requires ' +
+        'ecs:ExecuteCommand on the caller, which this stack grants to nobody.',
+    });
+
+    Validations.of(taskRole).acknowledge({
+      id: 'AwsSolutions-IAM5[Resource::*]',
+      reason:
+        'The only remaining "*" on this role is the ssmmessages:*Channel set that ECS ' +
+        'Exec requires. Those four actions do not support resource-level permissions.',
+    });
+
+    for (const action of ['s3:Abort*', 's3:DeleteObject*', 's3:GetBucket*', 's3:GetObject*', 's3:List*']) {
+      Validations.of(taskRole).acknowledge({
+        id: `AwsSolutions-IAM5[Action::${action}]`,
+        reason:
+          'Expanded by the CDK grantReadWrite() helper on the data bucket, not written ' +
+          'by hand, and scoped to one bucket created by this stack.',
+      });
+    }
+
+    Validations.of(taskRole).acknowledge({
+      id: 'AwsSolutions-IAM5[Resource::<DataBucketE3889A50.Arn>/*]',
+      reason:
+        'Object-level permissions on S3 are expressed as bucket-arn/*; there is no ' +
+        'narrower form. The bucket is created by this stack.',
+    });
+
+    for (const arn of ['arn:aws:bedrock:*:*:inference-profile/*', 'arn:aws:bedrock:*::foundation-model/*']) {
+      Validations.of(taskRole).acknowledge({
+        id: `AwsSolutions-IAM5[Resource::${arn}]`,
+        reason:
+          'An administrator picks the model after deployment through the admin UI, so ' +
+          'the model ARN is not knowable at synth time and pinning one here would ' +
+          'break that. Scoped to foundation models and inference profiles only: no ' +
+          'Bedrock control-plane, fine-tuning or provisioned-throughput action is granted.',
+      });
+    }
+
+    for (const arn of [
+      'arn:aws:athena:*:*:workgroup/*',
+      'arn:aws:glue:*:*:catalog',
+      'arn:aws:glue:*:*:database/*',
+      'arn:aws:glue:*:*:table/*/*',
+    ]) {
+      Validations.of(taskRole).acknowledge({
+        id: `AwsSolutions-IAM5[Resource::${arn}]`,
+        reason:
+          'Which Glue database or Athena workgroup a user queries is chosen after ' +
+          'deployment, so it cannot be named at synth time. This statement was "*" and ' +
+          'is now confined to Athena workgroups and Glue catalog objects.',
+      });
+    }
+
+    Validations.of(taskDef).acknowledge({
+      id: 'AwsSolutions-IAM5[Resource::*]',
+      reason:
+        'ecr:GetAuthorizationToken does not support resource-level permissions. The ' +
+        'statement is generated by the CDK ECS construct; the image-pull actions beside ' +
+        'it are already scoped to the asset repository and the secret read to one ' +
+        'secret ARN.',
+    });
+
+    Validations.of(taskDef).acknowledge({
+      id: 'AwsSolutions-ECS2',
+      reason:
+        'The environment block carries table names, bucket names, the region and model ' +
+        'identifiers -- configuration, not credentials. The one secret that used to be ' +
+        'here, AGENTIC_AUTO_JWT_SECRET, now comes from Secrets Manager through the ' +
+        'container secrets block, because a value referenced from `environment` is ' +
+        'written into the task definition in plaintext and is readable with ' +
+        'ecs:DescribeTaskDefinition.',
+    });
+
+    Validations.of(albSg).acknowledge({
+      id: 'AwsSolutions-EC23',
+      reason:
+        'The ingress CIDR is the AllowedCIDRs CloudFormation parameter, which has no ' +
+        'value at synth time, so the rule cannot evaluate it and reports the unresolved ' +
+        'reference. The parameter has no default and its allowedPattern rejects ' +
+        '0.0.0.0/0, so CloudFormation refuses the open value before the group exists.',
+    });
+
+    for (const secret of [jwtSecretStore, adminPasswordStore]) {
+      Validations.of(secret).acknowledge({
+        id: 'AwsSolutions-SMG4',
+        reason:
+          'Automatic rotation needs a rotation function that understands the consumer. ' +
+          'Rotating the token signing secret invalidates every live session the instant ' +
+          'it changes, so doing it safely requires the application to accept two keys ' +
+          'during an overlap window, which it does not yet. The admin password is a ' +
+          'bootstrap credential meant to be changed in the application after first ' +
+          'login. Both are documented in SECURITY.md as operator-rotated.',
+      });
+    }
 
     // ═══════ Outputs ═══════
     new cdk.CfnOutput(this, 'ApplicationURL', {
@@ -600,9 +855,24 @@ def handler(event, context):
     
     table = boto3.resource('dynamodb').Table(os.environ['CONFIG_TABLE'])
     
-    # Hash admin password
-    pw = os.environ['ADMIN_PASSWORD']  # Required — set via CFN parameter
-    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
+    # Admin credential.
+    #
+    # This wrote hashlib.sha256(pw) with no salt, under the key 'admin', and never
+    # wrote password_salt at all. The application verifies with
+    # local_auth._verify_password(password, hash, user['password_salt']), so the
+    # record it produced raised KeyError on the first login attempt -- which did
+    # not show up while authentication was off by default, and bricked login the
+    # moment it was turned on. The format, the salt and the key all have to match
+    # what local_auth expects, so they are derived the same way here.
+    sm = boto3.client('secretsmanager')
+    pw = sm.get_secret_value(SecretId=os.environ['ADMIN_PASSWORD_SECRET_ARN'])['SecretString']
+
+    PBKDF2_ITERATIONS = 600000  # keep in step with local_auth._PBKDF2_ITERATIONS
+    pw_salt = os.urandom(16).hex()
+    pw_hash = 'pbkdf2_sha256$%d$%s' % (
+        PBKDF2_ITERATIONS,
+        hashlib.pbkdf2_hmac('sha256', pw.encode(), pw_salt.encode(), PBKDF2_ITERATIONS).hex(),
+    )
     
     # Model config
     model_provider = os.environ.get('MODEL_PROVIDER', 'bedrock')
@@ -703,8 +973,16 @@ def handler(event, context):
         'semantic_layer': json.dumps({'metrics': {}, 'dimensions': {}, 'synonyms': {}, 'templates': {}}),
         'global_config': json.dumps({'auth_provider': auth_provider}),
         'custom_models': json.dumps(default_models),
+        # Keyed by the address local_auth._ensure_admin() looks for, so it sees
+        # the account as present and does not try to create a second one. The
+        # shortname fallback in local_login means 'admin' still works as a login.
         'local_users': json.dumps({
-            'admin': {'password_hash': pw_hash, 'role': 'admin', 'email': 'admin@agentic-data.local'},
+            'admin@agentic-data.com': {
+                'email': 'admin@agentic-data.com',
+                'role': 'admin',
+                'password_hash': pw_hash,
+                'password_salt': pw_salt,
+            },
         }),
     }
     

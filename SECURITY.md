@@ -256,3 +256,151 @@ name `api/main.py` imports from `auth.py` and asserts `auth.py` defines it.
 | `AGENTIC_AUTO_KEY_DIR` | unset | When set, a Snowflake `private_key_path` must resolve inside this directory. |
 
 Both default to the secure behaviour, so no infrastructure change is needed.
+
+## Fixed in v1.0.3 — the signing secret was readable from the task definition
+
+Found by standing up cdk_nag, which this content's product security review had
+asked for and which had never run. Two of these are defects introduced by
+v1.0.1, the first remediation pass.
+
+### The signing secret was stored in plaintext in the task definition
+
+v1.0.1 added a `JwtSigningSecret` CloudFormation parameter with `noEcho: true`
+and referenced it from the Fargate container's `environment` block. `noEcho` only
+hides a value from CloudFormation's own parameter display. A parameter referenced
+from `environment` is resolved by CloudFormation and written into the task
+definition revision, in plaintext:
+
+```
+Environment: [{ Name: AGENTIC_AUTO_JWT_SECRET, Value: { Ref: JwtSigningSecret } }]
+```
+
+Anyone holding `ecs:DescribeTaskDefinition` could read the signing secret, and
+with it mint valid local-auth tokens — the same authentication bypass the
+original report was about, by a different route. Task definition revisions are
+retained, so the value outlived any rotation.
+
+`AdminPassword` had the same shape, twice over: as an environment variable on the
+init Lambda, where `lambda:GetFunctionConfiguration` reads it, and as a custom
+resource property, which is stored in the stack and passed to the Lambda in the
+event payload.
+
+Both parameters now land in Secrets Manager. The task definition references the
+signing secret through the container `secrets` block, so the container receives
+it at start-up and the task definition holds only an ARN. The init Lambda
+receives the secret's ARN and reads it at run time. The custom resource property
+is gone — `timestamp` already forced the update it was there for.
+
+### Authentication was on by default, and nobody could log in
+
+v1.0.1 changed the default to authentication-on. The init Lambda, unchanged,
+wrote the admin record as:
+
+```python
+pw_hash = hashlib.sha256(pw.encode()).hexdigest()
+...
+'local_users': json.dumps({'admin': {'password_hash': pw_hash, 'role': 'admin', ...}})
+```
+
+No salt, keyed `admin`, and **no `password_salt` field at all**. The application
+verifies with `local_auth._verify_password(password, hash, user['password_salt'])`,
+so the first login attempt raised `KeyError`. Nothing set
+`AGENTIC_AUTO_ADMIN_PASSWORD` on the container either, so
+`local_auth._ensure_admin()` could not create a working account as a fallback.
+
+This was invisible while authentication defaulted to off. Turning it on made a
+deployment that could not be logged into at all.
+
+The init Lambda now derives the hash exactly the way the application does —
+PBKDF2-HMAC-SHA256, same iteration count, with the salt stored alongside — and
+keys the record by `admin@agentic-data.com`, the address `_ensure_admin()` looks
+for. `tests/test_hardening_regression.py` checks that a hash produced the
+Lambda's way verifies through the application's own `_verify_password`.
+
+### cdk_nag
+
+cdk_nag was the sixth remediation item and had never been run; before v1.0.1 it
+could not be, because a previous commit had deleted the build manifests and the
+stack would not synthesise. It now runs as a policy validation plugin on every
+`cdk synth`, so there is no separate command to remember and no way to ship a
+change without seeing the findings.
+
+The first run reported 25 errors and 6 warnings. Fixed rather than excused:
+
+| Rule | Was |
+|---|---|
+| `VPC7` | no VPC flow log — the response to this report advised reviewing logs for unauthorised access, and there were none at the network layer |
+| `ELB2` | no load balancer access logs — likewise |
+| `S1` | no S3 server access logging |
+| `S10` | the bucket policy permitted plaintext HTTP, so the encryption setting covered data at rest only |
+| `ECS4` | Container Insights disabled |
+| `DDB3` ×5 | no point-in-time recovery on any table |
+| `L1` ×2 | Lambda runtimes behind the current release |
+| — | no deployment circuit breaker: a task that cannot start took up to three hours to fail a deployment |
+
+Two IAM grants were scoped down instead of acknowledged:
+
+- The security-group Lambda held `ec2:AuthorizeSecurityGroupIngress` and
+  `RevokeSecurityGroupIngress` on `Resource: "*"` — it could rewrite the ingress
+  rules of **every security group in the account**. Now scoped to the one group
+  it manages, with the two read-only `Describe*` calls, which do not support
+  resource-level permissions, in a separate statement.
+- The task role held Athena and Glue actions on `Resource: "*"`. Now confined to
+  Athena workgroups and Glue catalog objects.
+
+Scoping those **raised** the cdk_nag count from 12 to 15, because the rule flags
+any `*` inside a resource ARN and a narrower ARN still contains one. The count
+went up while the permissions got smaller, which is worth knowing before anyone
+reads a finding count as a security score.
+
+What remains is acknowledged individually, each with its reason, in
+`cdk/lib/agentic-data-stack.ts`. cdk-nag v3 requires every finding to be named
+exactly, including the action or resource it covers, so an acknowledgement cannot
+silently grow to cover something new. The substantive ones:
+
+- `ecr:GetAuthorizationToken`, `ec2:Describe*` and the ECS Exec
+  `ssmmessages:*Channel` actions do not support resource-level permissions. `*`
+  is the only form AWS accepts.
+- The Bedrock model ARN is chosen by an administrator after deployment, so it
+  cannot be named at synth time.
+- `AwsSolutions-EC23` is a synth-time artefact: the ingress CIDR is a
+  CloudFormation parameter with no value yet, and its `allowedPattern` rejects
+  `0.0.0.0/0`.
+- `AwsSolutions-SMG4`: rotating the token signing secret invalidates every live
+  session the moment it changes. Doing that safely needs the application to accept
+  two keys during an overlap window, which it does not yet do. **Both secrets are
+  operator-rotated.**
+
+`cdk synth` now exits 0 with an empty `validation-report.json`.
+
+### A trade-off left in place, with a warning
+
+The default deployment is an internal load balancer on plaintext HTTP. It is not
+reachable from the internet, but bearer tokens still cross the VPC in the clear.
+Passing `-c certificate_arn=<acm-arn>` serves HTTPS instead — this works for an
+internal load balancer, not just a public one — and the stack now emits a
+synth-time warning when no certificate is supplied, rather than defaulting
+quietly.
+
+### Build tooling
+
+Installing cdk-nag floated `aws-cdk-lib` to 2.275.0, whose cloud assembly schema
+the pinned `aws-cdk` CLI 2.1114.1 cannot read, and `cdk synth` stopped working.
+The CLI is now `^2.1147.0`. Since `aws-cdk-lib` was already a floating `^2.245.0`
+dependency, any fresh `npm install` would have hit this; it was only the lockfile
+that hid it.
+
+### Verifying
+
+```bash
+python tests/test_cdk_hardening.py        # 32 checks, synthesises the stack
+python tests/test_hardening_regression.py # 24 checks
+python tests/test_auth_regression.py      #  9 checks
+```
+
+`tests/test_cdk_hardening.py` asserts against the synthesised template rather
+than the TypeScript, so a change that type-checks but produces the wrong template
+is caught. It synthesises three times: the default, `publicly_accessible=true`
+with no certificate (which must refuse to synthesise), and with a certificate
+(which must produce HTTPS plus a redirect). It skips rather than passes if
+`cdk/node_modules` is absent.

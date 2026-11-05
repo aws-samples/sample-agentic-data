@@ -6,7 +6,7 @@
 
 > ## ⚠️ 安全公告 / Security Notice
 >
-> **早于 `v1.0.2` 的版本含有多个 Critical 级别缺陷，请勿部署。**
+> **早于 `v1.0.3` 的版本含有多个 Critical 级别缺陷，请勿部署。**
 >
 > 认证默认为关闭（`AGENTIC_AUTO_AUTH_ENABLED` 默认 `false`），而随仓库提供的 CDK
 > 栈从未设置该变量。在该状态下，中间件为**每一个请求**注入 `role: "admin"` 身份，
@@ -16,15 +16,22 @@
 > 此问题由外部研究者通过 AWS Vulnerability Reporting Program 报告，CVSS 3.1 评分 **9.8
 > (Critical)**，CWE-306 / CWE-1188。
 >
-> `v1.0.2` 另外修复了：`POST /api/mcp/test` 会执行请求体里指定的命令（任务角色权限下的
+> `v1.0.3` 另外修复了：`POST /api/mcp/test` 会执行请求体里指定的命令（任务角色权限下的
 > 任意命令执行）；六个接口会去抓取请求体里指定的 URL，在 Fargate 上可读取
 > `169.254.170.2` 上的任务角色凭证；`authing` 认证路径完全不验签，可伪造任意用户登录。
 >
 > **如果你已经部署了旧版本：**
 > 1. 立即限制负载均衡器的入站访问，或将其改为内网（internal）。
-> 2. 升级到 `v1.0.2` 或更新，并在部署时显式传入 `AllowedCIDRs` 和 `JwtSigningSecret`。
+> 2. 升级到 `v1.0.3` 或更新，并在部署时显式传入 `AllowedCIDRs` 和 `JwtSigningSecret`。
 > 3. 审查负载均衡器和应用日志，排查未经授权的访问。
 > 4. 轮换该部署用过的全部凭证 —— 任务角色、数据源密码、模型 API key。
+>
+> **如果你部署过 `v1.0.1` 或 `v1.0.2`，还要多做一步：** 这两个版本把 JWT 签名密钥以明文
+> 写进了 ECS 任务定义（`noEcho` 参数对此无效），任何有 `ecs:DescribeTaskDefinition`
+> 权限的人都能读到并伪造任意用户的 token。任务定义的历史修订会一直保留。请轮换
+> `JwtSigningSecret` 并注销旧的任务定义修订。这两个版本还有一个后果：认证默认打开了，
+> 但初始化 Lambda 写的管理员密码格式与应用校验的格式不一致，导致**根本无法登录**。
+> `v1.0.3` 修复了这一点。
 >
 > 已修复的内容见 [SECURITY.md](SECURITY.md)。问题报告请发至 aws-security@amazon.com。
 
