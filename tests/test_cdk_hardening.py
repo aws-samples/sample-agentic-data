@@ -62,9 +62,16 @@ def _run_synth(context=None):
     args = [NPX, "cdk", "synth", "--json"]
     for key, value in (context or {}).items():
         args += ["-c", f"{key}={value}"]
+    # Pinned to the stack's own default region so the result does not depend on
+    # whatever AWS_REGION the developer's shell happens to export. The VPC needs
+    # an availability-zone lookup per region; in an uncached region that lookup
+    # calls AWS and fails without live credentials, which made this suite pass or
+    # fail depending on the machine rather than on the template.
+    env = dict(os.environ, AWS_REGION="us-east-1", AWS_DEFAULT_REGION="us-east-1",
+               CDK_DEFAULT_REGION="us-east-1")
     # nosemgrep: dangerous-subprocess-use-audit
     return subprocess.run(  # nosec B603 B607
-        args, cwd=CDK, capture_output=True, text=True, timeout=900, shell=False,
+        args, cwd=CDK, capture_output=True, text=True, timeout=900, shell=False, env=env,
     )
 
 
@@ -299,6 +306,9 @@ else:
           ))
 
 # ── no deploy-time credential may reach a resource property ─────────
+# Failure details in this section are counts only. Anything derived from the
+# container's Secrets block or from credential-named variables stays out of
+# print(), even when it holds names rather than values.
 # Done with canaries rather than by reading the TypeScript: synthesise with
 # distinctive values and then search the whole template for them. A parameter or
 # context value referenced from a task definition's `environment` or a Lambda's
@@ -337,7 +347,7 @@ else:
         # offers a *_secret_arn context value to avoid even that.
         unexpected = {t: l for t, l in carriers.items() if t != "AWS::SecretsManager::Secret"}
         check(f"the {label} reaches nothing but a Secrets Manager resource",
-              not unexpected, unexpected)
+              not unexpected, f"{len(unexpected)} other resource type(s)")
 
     canary_td = [r for r in canary_res.values() if r["Type"] == "AWS::ECS::TaskDefinition"][0]
     canary_container = canary_td["Properties"]["ContainerDefinitions"][0]
@@ -345,10 +355,9 @@ else:
     secret_names = [x["Name"] for x in canary_container.get("Secrets", [])]
 
     check("no environment variable on the task is named like a credential",
-          not [n for n in env_names if "PASSWORD" in n or "API_KEY" in n or "SECRET" in n],
-          [n for n in env_names if "PASSWORD" in n or "API_KEY" in n or "SECRET" in n])
+          not [n for n in env_names if "PASSWORD" in n or "API_KEY" in n or "SECRET" in n])
     check("a configured data-source password arrives through the secrets block",
-          "POSTGRES_PASSWORD" in secret_names, secret_names)
+          "POSTGRES_PASSWORD" in secret_names)
 
     canary_lambdas = {
         lid: r for lid, r in canary_res.items() if r["Type"] == "AWS::Lambda::Function"
@@ -361,13 +370,14 @@ else:
             # Only an ARN reference is acceptable here.
             if not name.endswith("_SECRET_ARN"):
                 offenders.append(f"{lid}.{name}")
-    check("a Lambda receives credentials only as a secret ARN", not offenders, offenders)
+    check("a Lambda receives credentials only as a secret ARN", not offenders,
+          f"{len(offenders)} variable(s)")
 
     # OPENAI_API_KEY was on the task definition and nothing read it from the
     # environment: the application takes the key from the model record in
     # DynamoDB. It disclosed a credential no consumer wanted.
     check("the unread OPENAI_API_KEY environment variable is gone",
-          "OPENAI_API_KEY" not in env_names, env_names)
+          "OPENAI_API_KEY" not in env_names)
 
 
 print()
