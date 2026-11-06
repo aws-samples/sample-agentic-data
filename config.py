@@ -88,6 +88,10 @@ TABLEAU_USERNAME = os.environ.get("TABLEAU_USERNAME", "")
 TABLEAU_PASSWORD = os.environ.get("TABLEAU_PASSWORD", "")
 
 # Cognito Hosted UI
-COGNITO_DOMAIN = os.environ.get("AGENTIC_AUTO_COGNITO_DOMAIN", "agentic-data-demo.auth.us-west-1.amazoncognito.com")
-COGNITO_REDIRECT_URI = os.environ.get("AGENTIC_AUTO_COGNITO_REDIRECT_URI", "https://demo.nubility.cn/")
-COGNITO_LOGOUT_URI = os.environ.get("AGENTIC_AUTO_COGNITO_LOGOUT_URI", "https://demo.nubility.cn/")
+# No defaults. These used to point at the author's demo environment, so a
+# deployment that did not set them sent its users' sign-in to that Cognito
+# domain and its redirect to that host. Unset means the hosted UI is off and the
+# login page shows the password form instead.
+COGNITO_DOMAIN = os.environ.get("AGENTIC_AUTO_COGNITO_DOMAIN", "")
+COGNITO_REDIRECT_URI = os.environ.get("AGENTIC_AUTO_COGNITO_REDIRECT_URI", "")
+COGNITO_LOGOUT_URI = os.environ.get("AGENTIC_AUTO_COGNITO_LOGOUT_URI", "")

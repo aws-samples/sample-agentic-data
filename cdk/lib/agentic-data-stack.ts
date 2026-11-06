@@ -465,7 +465,11 @@ def send_response(url, event, status, reason=''):
       // library default is what produced the original defect: the stack set
       // AUTH_PROVIDER and nothing set AUTH_ENABLED, so every deployment ran open.
       AGENTIC_AUTO_AUTH_ENABLED: 'true',
-      AUTH_PROVIDER: authProvider,
+      // The application reads AGENTIC_AUTO_AUTH_PROVIDER. This block used to set
+      // only AUTH_PROVIDER, which nothing in the container reads, so every
+      // deployment ran as "cognito" -- the application default -- regardless of
+      // the auth_provider context value. Same naming mismatch as above.
+      AGENTIC_AUTO_AUTH_PROVIDER: authProvider,
       MODEL_PROVIDER: modelProvider,
       DEFAULT_MODEL: modelId,
     };

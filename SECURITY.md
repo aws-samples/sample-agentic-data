@@ -765,3 +765,33 @@ that a Lambda receives credentials only as a `*_SECRET_ARN`, and that the unread
 
 Reading the source would not have caught this. The canary does, and it will catch
 the next one.
+
+## Fixed in v1.0.6 — sign-in pointed at the author's demo environment
+
+Raised by the Guardian on `D435608595` as a non-blocking suggestion. It turned out
+to be a functional break on every CDK deployment, not just a stale default.
+
+`config.py` defaulted `COGNITO_DOMAIN` to `agentic-data-demo.auth.us-west-1.amazoncognito.com`
+and `COGNITO_REDIRECT_URI` / `COGNITO_LOGOUT_URI` to `https://demo.nubility.cn/`.
+Two more things combined with that:
+
+- **The CDK stack set the wrong variable.** It set `AUTH_PROVIDER`; the application
+  reads `AGENTIC_AUTO_AUTH_PROVIDER`. Nothing in the container read what the stack
+  set, so every deployment ran as the application default, `cognito`, whatever the
+  `auth_provider` context said. The same naming mismatch as the original defect,
+  where the stack set `AUTH_PROVIDER` and nothing set `AUTH_ENABLED`.
+- **`/api/auth/config` returned `hosted_ui: true` unconditionally** in `cognito` mode,
+  and the login page, when it sees that, renders a single button linking to the
+  hosted UI and no password form.
+
+So a CDK deployment's login page offered one button, to the author's demo Cognito
+domain with an empty `client_id` and a redirect to the author's host, and no other
+way to sign in. Invisible while authentication defaulted to off, like the init
+Lambda's password format.
+
+Now: the three defaults are empty; the hosted UI is advertised only when domain,
+client id and redirect URI are all configured, and otherwise the login page shows
+the password form; `/api/auth/callback` refuses with 503 rather than building
+`https:///oauth2/token`; and the stack sets `AGENTIC_AUTO_AUTH_PROVIDER`, with the
+same value the init Lambda uses to seed the users table. Five checks cover it,
+across `tests/test_hardening_regression.py` and `tests/test_cdk_hardening.py`.

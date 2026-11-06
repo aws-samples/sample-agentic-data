@@ -611,6 +611,52 @@ def _():
     assert imported <= {"logging", "uuid", "__future__"}, imported
 
 
+# ─────────── hosted sign-in must not point at someone else's domain ───────────
+
+@check("no Cognito hosted-UI setting defaults to the author's demo environment")
+def _():
+    # These defaulted to agentic-data-demo.auth.us-west-1.amazoncognito.com and
+    # https://demo.nubility.cn/, so a deployment that did not set them sent its
+    # users' sign-in to that domain.
+    tree = ast.parse(_source("config.py"))
+    defaults = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            call = node.value
+            if (isinstance(call.func, ast.Attribute) and call.func.attr == "get"
+                    and len(call.args) == 2 and isinstance(call.args[1], ast.Constant)):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        defaults[target.id] = call.args[1].value
+    for name in ("COGNITO_DOMAIN", "COGNITO_REDIRECT_URI", "COGNITO_LOGOUT_URI"):
+        assert name in defaults, f"{name} not found in config.py"
+        assert defaults[name] == "", f"{name} defaults to {defaults[name]!r}"
+
+
+@check("the hosted UI is only advertised once it is actually configured")
+def _():
+    # The login page renders only a hosted-UI button when hosted_ui is true, with
+    # no password form. Returning it unconditionally left an unconfigured
+    # deployment with no way to sign in.
+    tree = ast.parse(_source("api/main.py"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "api_auth_config")
+
+    def advertises(node):
+        return (isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+                and any(isinstance(k, ast.Constant) and k.value == "hosted_ui"
+                        and isinstance(v, ast.Constant) and v.value is True
+                        for k, v in zip(node.value.keys, node.value.values)))
+
+    body = fn.body
+    idx = next(i for i, stmt in enumerate(body) if advertises(stmt))
+    guarded = any(
+        isinstance(stmt, ast.If) and "COGNITO_DOMAIN" in ast.unparse(stmt.test)
+        for stmt in body[:idx]
+    )
+    assert guarded, "hosted_ui: True is returned without checking COGNITO_DOMAIN first"
+
+
 print()
 if FAILED:
     print(f"{len(FAILED)} FAILED: {FAILED}")

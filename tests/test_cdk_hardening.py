@@ -144,6 +144,21 @@ check("the task sets AGENTIC_AUTO_AUTH_ENABLED=true",
 check("the task sets AGENTIC_DATA_ENV=production",
       env.get("AGENTIC_DATA_ENV") == "production", env.get("AGENTIC_DATA_ENV"))
 
+# The container used to receive only AUTH_PROVIDER, which the application does
+# not read, so every deployment ran as the application default ("cognito")
+# whatever auth_provider said. It must get the variable the application reads,
+# with the same value the init Lambda uses to seed the users table.
+init_fn = [r for k, r in RES.items() if r.get("Type") == "AWS::Lambda::Function" and "InitDataFn" in k]
+init_provider = init_fn[0]["Properties"]["Environment"]["Variables"].get("AUTH_PROVIDER") if init_fn else None
+check("the task sets the provider variable the application reads",
+      env.get("AGENTIC_AUTO_AUTH_PROVIDER") not in (None, ""))
+check("the task's provider matches the one the init Lambda seeds",
+      env.get("AGENTIC_AUTO_AUTH_PROVIDER") == init_provider)
+
+admin_param = PARAMS.get("AdminPassword", {})
+check("AdminPassword is required and NoEcho",
+      "Default" not in admin_param and admin_param.get("NoEcho") in (True, "true"))
+
 jwt_param = PARAMS.get("JwtSigningSecret", {})
 jwt_facts = {
     "no default": "Default" not in jwt_param,

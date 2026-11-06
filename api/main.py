@@ -3981,6 +3981,11 @@ def api_auth_config():
         return get_auth_config()
     if provider == "local":
         return {"hosted_ui": False, "provider": "local"}
+    # The login page renders only a hosted-UI button when this is true, with no
+    # password form, so advertising a hosted UI that is not configured leaves no
+    # way to sign in.
+    if not (COGNITO_DOMAIN and COGNITO_CLIENT_ID and COGNITO_REDIRECT_URI):
+        return {"hosted_ui": False, "provider": "cognito"}
     return {
         "hosted_ui": True,
         "domain": COGNITO_DOMAIN,
@@ -4004,6 +4009,8 @@ def api_auth_callback(body: dict):
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=result.get("error", "Token exchange failed"))
         return result
+    if not COGNITO_DOMAIN:
+        raise HTTPException(status_code=503, detail="Hosted sign-in is not configured on this deployment")
     import urllib.request, urllib.parse
     token_url = f"https://{COGNITO_DOMAIN}/oauth2/token"
     data = urllib.parse.urlencode({
